@@ -4,13 +4,9 @@
  * Thoughtbox MCP Server - Entry Point (Streamable HTTP)
  */
 
-import crypto from "node:crypto";
 import * as path from "node:path";
 import * as os from "node:os";
 import type { Request, Response } from "express";
-import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { createMcpServer } from "./server-factory.js";
 import {
   FileSystemStorage,
   InMemoryStorage,
@@ -28,8 +24,15 @@ import {
 import { createFileSystemHubStorage } from "./hub/hub-storage-fs.js";
 import type { HubStorage } from "./hub/hub-types.js";
 import { initEvaluation, initMonitoring } from "./evaluation/index.js";
-import { resolveApiKeyToWorkspace } from "./auth/api-key.js";
 import { createHubHandler, type HubEvent } from "./hub/hub-handler.js";
+import {
+  GatewayRegistry,
+  CompositeGatewayRuntime,
+  DedalusMarketplaceRuntime,
+} from "./gateway/index.js";
+import type { GatewayRuntime } from "./gateway/index.js";
+import { createThoughtboxMarketplaceHttpApp } from "./dedalus-marketplace/http.js";
+import type { Logger } from "./types.js";
 
 /**
  * Get the storage backend based on environment configuration.
@@ -143,11 +146,6 @@ async function createStorage(): Promise<StorageBundle> {
   };
 }
 
-interface SessionEntry {
-  transport: StreamableHTTPServerTransport;
-  server: Awaited<ReturnType<typeof createMcpServer>>;
-}
-
 async function maybeStartObservatory(hubStorage?: HubStorage, persistentStorage?: ThoughtboxStorage): Promise<ObservatoryServer | null> {
   const observatoryConfig = loadObservatoryConfig();
   if (!observatoryConfig.enabled) return null;
@@ -183,140 +181,36 @@ async function startHttpServer() {
   const traceListener = initEvaluation();
   initMonitoring(traceListener ?? undefined);
 
-  const app = createMcpExpressApp({
-    host: process.env.HOST || "0.0.0.0",
-  });
+  const gatewayLogger: Logger = {
+    debug(message, ...args) {
+      console.error(`[DEBUG] ${message}`, ...args);
+    },
+    info(message, ...args) {
+      console.error(`[INFO] ${message}`, ...args);
+    },
+    warn(message, ...args) {
+      console.error(`[WARN] ${message}`, ...args);
+    },
+    error(message, ...args) {
+      console.error(`[ERROR] ${message}`, ...args);
+    },
+  };
 
-  const sessions = new Map<string, SessionEntry>();
+  const fileGateway = await GatewayRegistry.fromDefaultManifest(gatewayLogger);
 
-  app.all("/mcp", async (req: Request, res: Response) => {
-    const mcpSessionId = req.headers["mcp-session-id"] as string | undefined;
+  let gateway: GatewayRuntime = fileGateway;
+  const dedalusApiKey = process.env.DEDALUS_API_KEY;
+  if (dedalusApiKey) {
+    const marketplace = new DedalusMarketplaceRuntime(
+      dedalusApiKey,
+      gatewayLogger,
+    );
+    gateway = new CompositeGatewayRuntime([fileGateway, marketplace]);
+    await gateway.refresh();
+    gatewayLogger.info("[Dedalus] Marketplace integration enabled");
+  }
 
-    console.error(`[MCP] ${req.method} request, session: ${mcpSessionId || 'new'}`);
-
-    // API key auth (ADR-AUTH-02): check ?key= query param or Authorization: Bearer <key>
-    let workspaceId: string | undefined = undefined;
-    const authHeader = req.headers.authorization as string | undefined;
-    const headerKey = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
-    const queryKey = req.query.key as string | undefined;
-    const providedKey = headerKey || queryKey;
-    const staticApiKey = process.env.THOUGHTBOX_API_KEY;
-
-    if (providedKey) {
-      if (staticApiKey && providedKey === staticApiKey) {
-        // Static API key match (ADR-AUTH-02)
-        workspaceId = 'default-workspace';
-      } else if (providedKey === process.env.THOUGHTBOX_API_KEY_LOCAL) {
-        // Bypass for local development
-        workspaceId = 'local-dev-workspace';
-      } else if (providedKey.startsWith('tbx_')) {
-        // Prefixed key — resolve via api_keys table
-        try {
-          workspaceId = await resolveApiKeyToWorkspace(providedKey);
-        } catch (err) {
-          res.status(401).json({
-            jsonrpc: "2.0",
-            error: { code: -32001, message: "Invalid or inactive API key" },
-            id: null,
-          });
-          return;
-        }
-      } else {
-        res.status(401).json({
-          jsonrpc: "2.0",
-          error: { code: -32001, message: "Invalid API key" },
-          id: null,
-        });
-        return;
-      }
-    } else if (process.env.THOUGHTBOX_STORAGE === 'supabase') {
-       // Require key for hosted environment
-       res.status(401).json({
-        jsonrpc: "2.0",
-        error: { code: -32001, message: "Missing API key" },
-        id: null,
-      });
-      return;
-    }
-
-    try {
-      if (mcpSessionId && sessions.has(mcpSessionId)) {
-        const entry = sessions.get(mcpSessionId)!;
-        await entry.transport.handleRequest(req, res, req.body);
-
-        if (req.method === "DELETE") {
-          sessions.delete(mcpSessionId);
-          entry.transport.close();
-        }
-        return;
-      }
-
-      const sessionId = mcpSessionId || crypto.randomUUID();
-
-      // Instantiate strictly-scoped storage using the resolved workspaceId
-      const storage = factory.getStorage(workspaceId);
-      const knowledgeStorage = factory.getKnowledgeStorage(workspaceId);
-
-      const server = await createMcpServer({
-        sessionId,
-        storage,
-        hubStorage,
-        dataDir,
-        knowledgeStorage,
-        config: {
-          disableThoughtLogging:
-            (process.env.DISABLE_THOUGHT_LOGGING || "").toLowerCase() === "true",
-        },
-      });
-
-      const transport = new StreamableHTTPServerTransport({
-        sessionIdGenerator: () => sessionId,
-        enableJsonResponse: true,
-      });
-
-      sessions.set(sessionId, {
-        transport,
-        server,
-      });
-
-      transport.onclose = () => {
-        sessions.delete(transport.sessionId || sessionId);
-      };
-
-      await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-
-      if (req.method === "DELETE") {
-        sessions.delete(sessionId);
-        transport.close();
-      }
-    } catch (error) {
-      console.error("MCP ERROR:", error);
-      if (!res.headersSent) {
-        res.status(500).json({
-          jsonrpc: "2.0",
-          error: { code: -32603, message: "Internal server error" },
-          id: null,
-        });
-      }
-    }
-  });
-
-  app.get("/health", (_: Request, res: Response) =>
-    res.json({
-      status: "ok",
-      transport: "streamable-http",
-      server: "thoughtbox",
-      version: "1.2.2",
-    })
-  );
-
-  app.get("/info", (_: Request, res: Response) =>
-    res.json({
-      status: "ok",
-      server: { name: "thoughtbox-server", version: "1.2.2" },
-    })
-  );
+  const app = createThoughtboxMarketplaceHttpApp({ gateway });
 
   // ---------------------------------------------------------------------------
   // Hub Event SSE Endpoint — pushes HubEvents to Channel subscribers
@@ -428,13 +322,7 @@ async function startHttpServer() {
   });
 
   const shutdown = async () => {
-    for (const entry of sessions.values()) {
-      try {
-        entry.transport.close();
-      } catch {
-        // ignore
-      }
-    }
+    await Promise.allSettled([gateway.close()]);
     if (observatoryServer?.isRunning()) {
       try {
         await observatoryServer.stop();

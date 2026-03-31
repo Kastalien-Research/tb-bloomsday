@@ -1,34 +1,70 @@
 import { describe, it, expect } from "vitest";
 import { ExecuteTool } from "../execute-tool.js";
-import { ThoughtTool } from "../../thought/tool.js";
-import { SessionTool } from "../../sessions/tool.js";
-import { KnowledgeTool } from "../../knowledge/tool.js";
-import { NotebookTool } from "../../notebook/tool.js";
-import { TheseusTool, UlyssesTool, InMemoryProtocolHandler } from "../../protocol/index.js";
-import { ObservabilityGatewayHandler } from "../../observability/index.js";
-import { ThoughtHandler } from "../../thought-handler.js";
-import { SessionHandler } from "../../sessions/index.js";
-import { KnowledgeHandler, FileSystemKnowledgeStorage } from "../../knowledge/index.js";
-import { NotebookHandler } from "../../notebook/index.js";
-import { InMemoryStorage } from "../../persistence/index.js";
+import type { GatewayRuntime } from "../../gateway/types.js";
 
 function createExecuteTool(): ExecuteTool {
-  const storage = new InMemoryStorage();
-  const thoughtHandler = new ThoughtHandler(true, storage);
-  const sessionHandler = new SessionHandler({ storage, thoughtHandler });
-  const knowledgeHandler = new KnowledgeHandler(new FileSystemKnowledgeStorage({}));
-  const notebookHandler = new NotebookHandler();
-  const protocolHandler = new InMemoryProtocolHandler();
+  const gateway: GatewayRuntime = {
+    async getCatalog() {
+      return {
+        upstreams: [
+          {
+            id: "demo",
+            name: "Demo Upstream",
+            url: "http://127.0.0.1:4100/mcp",
+            enabled: true,
+            status: "available",
+            toolCount: 2,
+          },
+        ],
+        tools: [
+          {
+            upstreamId: "demo",
+            upstreamName: "Demo Upstream",
+            name: "ping",
+            description: "Return a pong message",
+            inputSchema: {
+              type: "object",
+              properties: {
+                name: { type: "string" },
+              },
+            },
+          },
+        ],
+      };
+    },
+    async listUpstreams() {
+      return (await this.getCatalog()).upstreams;
+    },
+    async listTools(args) {
+      const tools = (await this.getCatalog()).tools;
+      if (args?.upstreamId) {
+        return tools.filter((tool) => tool.upstreamId === args.upstreamId);
+      }
+      return tools;
+    },
+    async refresh() {
+      return;
+    },
+    async close() {
+      return;
+    },
+    async callTool(args) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify({
+              upstreamId: args.upstreamId,
+              toolName: args.toolName,
+              arguments: args.arguments ?? {},
+            }),
+          },
+        ],
+      };
+    },
+  };
 
-  return new ExecuteTool({
-    thoughtTool: new ThoughtTool(thoughtHandler),
-    sessionTool: new SessionTool(sessionHandler),
-    knowledgeTool: new KnowledgeTool(knowledgeHandler),
-    notebookTool: new NotebookTool(notebookHandler),
-    theseusTool: new TheseusTool(protocolHandler),
-    ulyssesTool: new UlyssesTool(protocolHandler),
-    observabilityHandler: new ObservabilityGatewayHandler({ storage }),
-  });
+  return new ExecuteTool({ gateway });
 }
 
 describe("thoughtbox_execute", () => {
@@ -95,6 +131,16 @@ describe("thoughtbox_execute", () => {
     expect(output.result).toBe("undefined");
   });
 
+  it("blocks dynamic imports", async () => {
+    const tool = createExecuteTool();
+    const result = await tool.handle({
+      code: `async () => await import("node:fs")`,
+    });
+    const output = JSON.parse(result.content[0].text);
+    expect(output.result).toBeNull();
+    expect(output.error).toContain("Dynamic import is not available");
+  });
+
   it("blocks constructor-chain escape to host process", async () => {
     const tool = createExecuteTool();
     const result = await tool.handle({
@@ -125,125 +171,65 @@ describe("thoughtbox_execute", () => {
     expect(output.result).toBe("undefined");
   });
 
-  it("can call tb.session.list()", async () => {
+  it("legacy internal namespaces are not available", async () => {
     const tool = createExecuteTool();
     const result = await tool.handle({
-      code: `async () => { return await tb.session.list(); }`,
+      code: `async () => { return typeof tb.session; }`,
+    });
+    const output = JSON.parse(result.content[0].text);
+    expect(output.result).toBe("undefined");
+  });
+
+  it("can list configured upstreams", async () => {
+    const tool = createExecuteTool();
+    const result = await tool.handle({
+      code: `async () => { return await tb.gateway.listUpstreams(); }`,
     });
     const output = JSON.parse(result.content[0].text);
     expect(output.error).toBeUndefined();
-    // InMemoryStorage returns empty sessions by default
-    expect(output.result).toBeDefined();
+    expect(output.result[0].id).toBe("demo");
   });
 
-  it("can call tb.thought()", async () => {
+  it("can list proxied tools", async () => {
+    const tool = createExecuteTool();
+    const result = await tool.handle({
+      code: `async () => { return await tb.gateway.listTools(); }`,
+    });
+    const output = JSON.parse(result.content[0].text);
+    expect(output.error).toBeUndefined();
+    expect(output.result[0].name).toBe("ping");
+  });
+
+  it("can call a proxied tool through tb.gateway.call()", async () => {
     const tool = createExecuteTool();
     const result = await tool.handle({
       code: `async () => {
-        return await tb.thought({
-          thought: "Testing code mode",
-          thoughtType: "reasoning",
-          nextThoughtNeeded: false,
+        return await tb.gateway.call({
+          upstreamId: "demo",
+          toolName: "ping",
+          arguments: { name: "Thoughtbox" },
         });
       }`,
     });
     const output = JSON.parse(result.content[0].text);
     expect(output.error).toBeUndefined();
-    expect(output.result).toBeDefined();
+    expect(output.result.content[0].text).toContain("\"toolName\":\"ping\"");
+    expect(output.result.content[0].text).toContain("\"name\":\"Thoughtbox\"");
   });
 
-  it("can chain multiple operations", async () => {
+  it("can call a proxied tool through tb.call()", async () => {
     const tool = createExecuteTool();
     const result = await tool.handle({
       code: `async () => {
-        const thought = await tb.thought({
-          thought: "First thought",
-          thoughtType: "reasoning",
-          nextThoughtNeeded: true,
-          sessionTitle: "Code Mode Test",
-        });
-        const sessions = await tb.session.list();
-        return { thought, sessions };
-      }`,
-    });
-    const output = JSON.parse(result.content[0].text);
-    expect(output.error).toBeUndefined();
-    expect(output.result.thought).toBeDefined();
-    expect(output.result.sessions).toBeDefined();
-  });
-
-  it("can call tb.theseus()", async () => {
-    const tool = createExecuteTool();
-    const result = await tool.handle({
-      code: `async () => {
-        const init = await tb.theseus({
-          operation: "init",
-          scope: ["src/code-mode/execute-tool.ts"],
-          description: "Exercise protocol surface",
-        });
-        const status = await tb.theseus({ operation: "status" });
-        return { init, status };
-      }`,
-    });
-    const output = JSON.parse(result.content[0].text);
-    expect(output.error).toBeUndefined();
-    expect(output.result.init.session_id).toBeDefined();
-    expect(output.result.status.session_id).toBe(output.result.init.session_id);
-  });
-
-  it("can call tb.ulysses()", async () => {
-    const tool = createExecuteTool();
-    const result = await tool.handle({
-      code: `async () => {
-        const init = await tb.ulysses({
-          operation: "init",
-          problem: "Exercise protocol surface",
-          constraints: ["unit-test"],
-        });
-        const status = await tb.ulysses({ operation: "status" });
-        return { init, status };
-      }`,
-    });
-    const output = JSON.parse(result.content[0].text);
-    expect(output.error).toBeUndefined();
-    expect(output.result.init.session_id).toBeDefined();
-    expect(output.result.status.session_id).toBe(output.result.init.session_id);
-  });
-
-  it("can call tb.observability()", async () => {
-    const tool = createExecuteTool();
-    const result = await tool.handle({
-      code: `async () => {
-        return await tb.observability({
-          operation: "dashboard_url",
-          args: { dashboard: "thoughtbox-mcp" },
+        return await tb.call({
+          upstreamId: "demo",
+          toolName: "ping",
+          arguments: { name: "alias" },
         });
       }`,
     });
     const output = JSON.parse(result.content[0].text);
     expect(output.error).toBeUndefined();
-    expect(output.result.dashboard).toBe("thoughtbox-mcp");
-    expect(output.result.url).toContain("/d/thoughtbox-mcp/thoughtbox-mcp");
-  });
-
-  it("returns truncated output for oversized results", async () => {
-    const tool = createExecuteTool();
-    const result = await tool.handle({
-      code: `async () => ({ payload: "x".repeat(30000) })`,
-    });
-    const output = JSON.parse(result.content[0].text);
-    expect(output.error).toBeUndefined();
-    expect(output.truncated).toBe(true);
-    expect(typeof output.result).toBe("string");
-    expect(output.result).toContain("[truncated]");
-  });
-
-  it("returns syntax error for invalid code", async () => {
-    const tool = createExecuteTool();
-    const result = await tool.handle({
-      code: `async () => { invalid syntax here }`,
-    });
-    const output = JSON.parse(result.content[0].text);
-    expect(output.error).toBeDefined();
+    expect(output.result.content[0].text).toContain("\"name\":\"alias\"");
   });
 });

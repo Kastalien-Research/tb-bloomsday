@@ -2,60 +2,94 @@ import { describe, it, expect } from "vitest";
 import { SearchTool } from "../search-tool.js";
 import { buildSearchCatalog } from "../search-index.js";
 
-const catalog = buildSearchCatalog();
+const catalog = buildSearchCatalog({
+  upstreams: [
+    {
+      id: "demo",
+      name: "Demo Upstream",
+      url: "http://127.0.0.1:4100/mcp",
+      enabled: true,
+      status: "available",
+      toolCount: 2,
+    },
+    {
+      id: "offline",
+      name: "Offline Upstream",
+      url: "http://127.0.0.1:4101/mcp",
+      enabled: true,
+      status: "unavailable",
+      toolCount: 0,
+      error: "connect ECONNREFUSED",
+    },
+  ],
+  tools: [
+    {
+      upstreamId: "demo",
+      upstreamName: "Demo Upstream",
+      name: "ping",
+      title: "Ping",
+      description: "Return a pong message",
+      inputSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string" },
+        },
+      },
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    {
+      upstreamId: "demo",
+      upstreamName: "Demo Upstream",
+      name: "echo",
+      title: "Echo",
+      description: "Echo structured input back to the caller",
+      inputSchema: {
+        type: "object",
+        properties: {
+          payload: { type: "string" },
+        },
+        required: ["payload"],
+      },
+    },
+  ],
+});
 const tool = new SearchTool(catalog);
 
 describe("thoughtbox_search", () => {
-  it("lists only the Code Mode operation modules", async () => {
+  it("lists configured gateway upstreams", async () => {
     const result = await tool.handle({
-      code: "async () => Object.keys(catalog.operations).sort()",
+      code: "async () => catalog.upstreams.map((upstream) => upstream.id).sort()",
     });
     const output = JSON.parse(result.content[0].text);
     expect(output.error).toBeUndefined();
-    expect(output.result).toEqual([
-      "knowledge",
-      "notebook",
-      "observability",
-      "session",
-      "theseus",
-      "thought",
-      "ulysses",
-    ]);
+    expect(output.result).toEqual(["demo", "offline"]);
   });
 
-  it("filters operations by module", async () => {
+  it("filters tools by upstream", async () => {
     const result = await tool.handle({
-      code: `async () => Object.keys(catalog.operations.session)`,
+      code: `async () => catalog.tools.filter((tool) => tool.upstreamId === "demo").map((tool) => tool.name).sort()`,
     });
     const output = JSON.parse(result.content[0].text);
-    expect(output.result).toContain("session_list");
-    expect(output.result).toContain("session_get");
+    expect(output.result).toEqual(["echo", "ping"]);
   });
 
-  it("searches prompts by name", async () => {
+  it("searches tool descriptions by keyword", async () => {
     const result = await tool.handle({
-      code: `async () => catalog.prompts.filter(p => p.name.includes('spec'))`,
+      code: `async () => catalog.tools.filter((tool) => (tool.description ?? "").toLowerCase().includes("pong")).map((tool) => tool.name)`,
     });
     const output = JSON.parse(result.content[0].text);
-    expect(output.result.length).toBeGreaterThanOrEqual(3);
-    expect(output.result.some((p: { name: string }) => p.name === "spec-designer")).toBe(true);
+    expect(output.result).toEqual(["ping"]);
   });
 
-  it("searches resources by URI pattern", async () => {
+  it("returns unavailable upstreams with their error state", async () => {
     const result = await tool.handle({
-      code: `async () => catalog.resources.filter(r => r.uri.includes('tests'))`,
+      code: `async () => catalog.upstreams.filter((upstream) => upstream.status !== "available")`,
     });
     const output = JSON.parse(result.content[0].text);
-    expect(output.result.length).toBeGreaterThanOrEqual(2);
-  });
-
-  it("returns resource templates", async () => {
-    const result = await tool.handle({
-      code: `async () => catalog.resourceTemplates.map(t => t.uriTemplate)`,
-    });
-    const output = JSON.parse(result.content[0].text);
-    expect(output.result.length).toBeGreaterThan(0);
-    expect(output.result.some((t: string) => t.includes("{sessionId}"))).toBe(true);
+    expect(output.result).toHaveLength(1);
+    expect(output.result[0].error).toContain("ECONNREFUSED");
   });
 
   it("returns durationMs in response envelope", async () => {
@@ -109,8 +143,6 @@ describe("thoughtbox_search", () => {
       code: `async () => { catalog.newProp = "bad"; return catalog.newProp; }`,
     });
     const output = JSON.parse(result.content[0].text);
-    // Object.freeze in sloppy mode: assignment silently fails, property not added
-    // undefined serializes to null in JSON
     expect(output.result).toBeNull();
   });
 });

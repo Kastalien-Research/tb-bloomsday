@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PreToolUse: Safety guards for all tool calls.
-# Does NOT enforce workflow — that's ulysses_enforcer.sh and bead_workflow_enforcer.sh.
+# This file only enforces generic safety and read-before-write.
 set -euo pipefail
 
 input_json=$(cat)

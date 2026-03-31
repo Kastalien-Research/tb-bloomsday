@@ -54,29 +54,11 @@ all 5 phases as a self-contained lifecycle.
 
 ### New session (no --resume)
 
-1. Check for existing HDD sessions:
-   ```bash
-   bd list --label=hdd --type=epic --json
-   ```
-   If an active session exists for this ADR number, warn and ask whether to resume or start fresh.
+1. Check for an existing `.hdd/state.json`. If it already describes this ADR, resume instead of creating parallel state.
 
-2. Create an epic and phase tasks in beads:
-   ```bash
-   EPIC_ID=$(bd create --title="ADR-${adr_number}: ${title}" \
-     --description="HDD session — hypotheses to be defined during research" \
-     --type=epic --priority=2 --json | jq -r '.id')
-   ```
+2. Initialize the HDD session directly on disk. The repo no longer uses Beads for HDD tracking.
 
-3. Create phase tasks with dependencies (Phase 2 depends on Phase 1, etc.):
-   - Phase 1: Research and Hypothesis Formation
-   - Phase 2: Stage Spec + ADR
-   - Phase 3: Implementation
-   - Phase 4: Validation
-   - Phase 5: Decision (Accept/Reject)
-
-   If `--phases=1-2`, only create tasks for Phases 1 and 2.
-
-4. Write state to `.hdd/state.json`:
+3. Write state to `.hdd/state.json`:
    ```json
    {
      "workflow": "hdd",
@@ -84,15 +66,7 @@ all 5 phases as a self-contained lifecycle.
      "adr_number": "<number>",
      "title": "<title>",
      "phase": "research",
-     "phases_requested": [1, 2, 3, 4, 5],
-     "epicId": "<bead-id>",
-     "phaseIds": {
-       "research": "<id>",
-       "stage": "<id>",
-       "implement": "<id>",
-       "validate": "<id>",
-       "decide": "<id>"
-     },
+      "phases_requested": [1, 2, 3, 4, 5],
      "status": "in_progress",
      "artifacts": [],
      "hypotheses": [],  // After Phase 1: [{ "id": "H1", "claim": "...", "prediction": "...", "validation": "...", "outcome": null }]
@@ -104,12 +78,12 @@ all 5 phases as a self-contained lifecycle.
    }
    ```
 
-5. Show the session dashboard and begin Phase 1.
+4. Show the session dashboard and begin Phase 1.
 
 ### Resume (--resume)
 
 1. Read `.hdd/state.json`
-2. Verify the epic and phase tasks still exist in beads
+2. Verify `.hdd/state.json` still exists and is internally coherent
 3. Show the dashboard with current state
 4. Resume from the current phase
 
@@ -459,7 +433,7 @@ prediction vs. evidence. Ask the user to:
 
    ADR-NNN accepted — all hypotheses validated.
    ```
-6. Close all phase tasks and the epic in beads
+6. Mark the HDD session complete and remove `.hdd/state.json`
 7. Clean up `.hdd/state.json`
 
 ### Path B: Hypotheses Invalidated
@@ -482,7 +456,7 @@ prediction vs. evidence. Ask the user to:
 
    [Brief explanation of what was learned]
    ```
-8. Close all phase tasks and the epic in beads
+8. Mark the HDD session rejected and remove `.hdd/state.json`
 9. Clean up `.hdd/state.json`
 
 ### Path C: Mixed Results
@@ -510,9 +484,9 @@ Classify each finding before acting:
 |-------------|--------|---------|
 | **Hypothesis gap** — a behavior the hypotheses should have tested but didn't | Amend ADR + fix code | "prefix-strip produces wrong internal names" |
 | **Spec gap** — the spec didn't cover a mapping or edge case | Amend ADR + update spec + fix code | "spec lists 41 operations but mapping table has 4" |
-| **Unrelated issue** — not caused by this ADR's changes | Create a separate bead; do NOT amend this ADR | "pre-existing bug in session handler" |
+| **Unrelated issue** — not caused by this ADR's changes | Create a separate follow-up task; do NOT amend this ADR | "pre-existing bug in session handler" |
 
-If the finding is **unrelated**, stop here. Create a bead and move on. The rest of
+If the finding is **unrelated**, stop here. Record a separate follow-up task and move on. The rest of
 this phase applies only to in-scope findings.
 
 ### Process
@@ -547,9 +521,7 @@ this phase applies only to in-scope findings.
    ADR-NNN post-review amendment — <gap summary>.
    ```
 
-6. **No new beads epic**. If the original epic is closed, reopen it with a note, or
-   create a single `fix` bead linked to the epic via `discovered-from`. Either way,
-   close it when the fix commit lands.
+6. **No new HDD session by default.** Handle post-review fixes inside the same ADR thread unless the review finding requires a distinct architectural decision.
 
 ### Learning Capture
 
@@ -614,7 +586,7 @@ Reject hypotheses that are vague ("performance is good"), implementation-focused
 ## Operational Rules
 
 1. **Orchestrator delegates**: You dispatch sub-agents for each phase. You do NOT read every implementation file or write production code yourself.
-2. **Persist state after every phase**: Update `.hdd/state.json` and beads after each phase completes. Crashes should be recoverable. **Write-then-verify**: after writing state, read it back and confirm the expected data is present. Conversation memory is not an artifact — if it's not on disk, it didn't happen.
+2. **Persist state after every phase**: Update `.hdd/state.json` after each phase completes. Crashes should be recoverable. **Write-then-verify**: after writing state, read it back and confirm the expected data is present. Conversation memory is not an artifact — if it's not on disk, it didn't happen.
 3. **One ADR per session**: Each HDD session produces exactly one ADR (accepted or rejected), plus one spec.
 4. **Atomic commits**: Code changes + ADR + spec in one commit, made after validation — not during implementation.
 5. **Document failures**: Rejected ADRs are as valuable as accepted ones. They prevent repeated mistakes. Rejected specs are removed (they describe unbuilt things).

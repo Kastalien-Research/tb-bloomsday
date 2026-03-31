@@ -1,8 +1,8 @@
 /**
  * Code Mode Search Tool
  *
- * Accepts LLM-generated JavaScript that runs against a frozen catalog
- * of operations, prompts, and resources. The LLM has full programmatic
+ * Accepts LLM-generated JavaScript that runs against a live catalog
+ * of gateway upstreams and proxied tools. The LLM has full programmatic
  * filtering power over the catalog — no need for predefined query patterns.
  */
 
@@ -19,40 +19,45 @@ const MAX_RESULT_BYTES = 24_000;
 export const searchToolInputSchema = z.object({
   code: z.string().describe(
     "JavaScript async arrow function that receives `catalog` and returns filtered results. " +
-    "Example: `async () => Object.keys(catalog.operations)` or " +
-    "`async () => catalog.prompts.filter(p => p.name.includes('spec'))`"
+    "Example: `async () => catalog.upstreams` or " +
+    "`async () => catalog.tools.filter(tool => tool.name.includes('search'))`"
   ),
 });
 
 export type SearchToolInput = z.infer<typeof searchToolInputSchema>;
+export type SearchCatalogSource = SearchCatalog | (() => SearchCatalog | Promise<SearchCatalog>);
 
 export const SEARCH_TOOL = {
   name: "thoughtbox_search",
-  description: `Discover Thoughtbox operations, prompts, and resources by writing JavaScript that queries the catalog.
+  description: `Discover gateway upstreams and proxied tools by writing JavaScript that queries the catalog.
 
 The \`catalog\` object is available in scope:
 
 interface SearchCatalog {
-  operations: Record<string, Record<string, {
-    title: string;
-    description: string;
-    category: string;
-    inputSchema?: object;
-  }>>;
-  prompts: Array<{ name: string; description: string; args: string[] }>;
-  resources: Array<{ name: string; uri: string; description: string; mimeType: string }>;
-  resourceTemplates: Array<{ name: string; uriTemplate: string; description: string; mimeType: string }>;
+  upstreams: Array<{
+    id: string;
+    name: string;
+    url: string;
+    status: "available" | "unavailable" | "disabled";
+    toolCount: number;
+    error?: string;
+  }>;
+  tools: Array<{
+    upstreamId: string;
+    upstreamName: string;
+    name: string;
+    title?: string;
+    description?: string;
+    inputSchema: object;
+    annotations?: object;
+  }>;
 }
 
-Modules in catalog.operations: session, thought, knowledge, notebook, theseus, ulysses, observability
-Legacy entrypoints like init and hub are intentionally absent from the Code Mode catalog.
-
 Examples:
-- List all modules: \`async () => Object.keys(catalog.operations)\`
-- Find session operations: \`async () => catalog.operations.session\`
-- Search by keyword: \`async () => { const q = "entity"; return Object.entries(catalog.operations).flatMap(([mod, ops]) => Object.entries(ops).filter(([_, op]) => op.description.toLowerCase().includes(q)).map(([name, op]) => ({ module: mod, name, title: op.title }))) }\`
-- Find prompts: \`async () => catalog.prompts.filter(p => p.name.includes('spec'))\`
-- List resources: \`async () => catalog.resources.map(r => ({ name: r.name, uri: r.uri }))\``,
+- List upstreams: \`async () => catalog.upstreams\`
+- Find available tools: \`async () => catalog.tools.filter(tool => tool.upstreamId === "demo")\`
+- Search by keyword: \`async () => catalog.tools.filter(tool => (tool.description ?? "").toLowerCase().includes("search"))\`
+- Find schema-bearing tools: \`async () => catalog.tools.filter(tool => Object.keys(tool.inputSchema.properties ?? {}).length > 0)\``,
   inputSchema: searchToolInputSchema,
   annotations: {
     readOnlyHint: true,
@@ -62,10 +67,18 @@ Examples:
 };
 
 export class SearchTool {
-  private catalog: SearchCatalog;
+  private readonly catalogSource: SearchCatalogSource;
 
-  constructor(catalog: SearchCatalog) {
-    this.catalog = catalog;
+  constructor(catalogSource: SearchCatalogSource) {
+    this.catalogSource = catalogSource;
+  }
+
+  private async getCatalog(): Promise<SearchCatalog> {
+    if (typeof this.catalogSource === "function") {
+      return this.catalogSource();
+    }
+
+    return this.catalogSource;
   }
 
   async handle(input: SearchToolInput): Promise<{ content: Array<{ type: "text"; text: string }> }> {
@@ -84,8 +97,9 @@ export class SearchTool {
       },
     };
 
+    const catalog = await this.getCatalog();
     const sandbox = {
-      catalog: Object.freeze(this.catalog),
+      catalog: Object.freeze(catalog),
       console: cappedConsole,
       JSON,
       Object,
