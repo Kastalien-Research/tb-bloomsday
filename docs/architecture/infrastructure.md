@@ -52,7 +52,7 @@ Secrets managed by Terraform (`infra/gcp/execution.tf`) for the agent runner:
 | `anthropic-api-key` | Shared with MCP service |
 | `supabase-url` | Shared with MCP service |
 | `supabase-anon-key` | Client-side Supabase access |
-| `supabase-jwt-secret` | JWT verification (legacy — see bd memory) |
+| `supabase-jwt-secret` | JWT verification (legacy auth compatibility) |
 
 ### Artifact Registry
 

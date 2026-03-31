@@ -1,69 +1,59 @@
 /**
  * Code Mode Execute Tool
  *
- * Accepts LLM-generated JavaScript that chains Thoughtbox operations
- * via the `tb` SDK object. Runs in a node:vm sandbox with only
- * the tb namespace, console, and standard builtins available.
+ * Accepts LLM-generated JavaScript that works against proxied MCP
+ * tools via the `tb` SDK object. The host launches a dedicated worker
+ * and exposes only the narrow `tb.gateway` RPC surface into that worker.
  */
 
-import * as vm from "node:vm";
+import { Worker } from "node:worker_threads";
 import { z } from "zod";
 import type { CodeModeResult } from "./types.js";
 import { TB_SDK_TYPES } from "./sdk-types.js";
 import { traceExecute } from "./trace.js";
+import type { GatewayRuntime } from "../gateway/types.js";
+import { executeWorkerMain } from "./execute-worker.js";
 
-import type { ThoughtTool, ThoughtToolInput } from "../thought/tool.js";
-import type { SessionTool, SessionToolInput } from "../sessions/tool.js";
-import type { KnowledgeTool, KnowledgeToolInput } from "../knowledge/tool.js";
-import type { NotebookTool, NotebookToolInput } from "../notebook/tool.js";
-import type { TheseusTool, TheseusToolInput } from "../protocol/theseus-tool.js";
-import type { UlyssesTool, UlyssesToolInput } from "../protocol/ulysses-tool.js";
-import type { ObservabilityGatewayHandler, ObservabilityInput } from "../observability/gateway-handler.js";
-
-const MAX_LOGS = 100;
 const TIMEOUT_MS = 30_000;
 const MAX_RESULT_BYTES = 24_000;
 
 export const executeToolInputSchema = z.object({
   code: z.string().describe(
     "JavaScript async arrow function using the `tb` SDK. " +
-    "Example: `async () => { const s = await tb.session.list(); return s; }`"
+      "Example: `async () => { const tools = await tb.gateway.listTools(); return tools; }`",
   ),
 });
 
 export type ExecuteToolInput = z.infer<typeof executeToolInputSchema>;
 
 export interface ExecuteToolDeps {
-  thoughtTool: ThoughtTool;
-  sessionTool: SessionTool;
-  knowledgeTool: KnowledgeTool;
-  notebookTool: NotebookTool;
-  theseusTool: TheseusTool;
-  ulyssesTool: UlyssesTool;
-  observabilityHandler: ObservabilityGatewayHandler;
+  gateway: GatewayRuntime;
 }
 
 export const EXECUTE_TOOL = {
   name: "thoughtbox_execute",
-  description: `Run JavaScript using the \`tb\` SDK to chain Thoughtbox operations in a single call.
+  description: `Run JavaScript using the \`tb\` SDK to inspect upstreams and call proxied MCP tools in a single call.
 
 ${TB_SDK_TYPES}
 
 Example:
 \`\`\`js
 async () => {
-  const sessions = await tb.session.list();
-  await tb.thought({
-    thought: "Analyzing prior sessions",
-    thoughtType: "reasoning",
-    nextThoughtNeeded: true,
+  const tools = await tb.gateway.listTools();
+  const target = tools.find((tool) => tool.name === "ping");
+  if (!target) {
+    throw new Error("No ping tool found");
+  }
+
+  return await tb.gateway.call({
+    upstreamId: target.upstreamId,
+    toolName: target.name,
   });
-  return sessions;
 }
 \`\`\`
 
 Use \`console.log()\` for debugging — output captured in response logs.
-All tb methods return their result directly (already parsed from the tool response).`,
+\`tb.gateway.call()\` returns the raw upstream MCP tool result.`,
   inputSchema: executeToolInputSchema,
   annotations: {
     readOnlyHint: false,
@@ -72,137 +62,169 @@ All tb methods return their result directly (already parsed from the tool respon
   },
 };
 
-/**
- * Extract the result value from a tool handler response.
- * Tool handlers return { content: [{ type: "text", text: "..." }] }.
- * We parse the JSON text and return the value directly.
- */
-function unwrapToolResult(raw: unknown): unknown {
-  if (!raw || typeof raw !== "object") return raw;
-  const obj = raw as Record<string, unknown>;
-  if (obj.isError) {
-    const text = (obj.content as Array<{ text: string }>)?.[0]?.text;
-    throw new Error(text ?? "Tool execution failed");
-  }
-  const content = obj.content as Array<{ type: string; text: string }> | undefined;
-  if (!content?.[0]?.text) return raw;
+type ExecuteWorkerMessage =
+  | {
+      type: "rpc";
+      id: number;
+      method: string;
+      args?: unknown;
+    }
+  | {
+      type: "result";
+      result: unknown;
+      logs?: unknown;
+      error?: string;
+    };
+
+type ExecuteWorkerResult = {
+  result: unknown;
+  logs: string[];
+  error?: string;
+};
+
+function normalizeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function handleWorkerRpc(
+  deps: ExecuteToolDeps,
+  worker: Worker,
+  message: Extract<ExecuteWorkerMessage, { type: "rpc" }>,
+): Promise<void> {
+  const respond = (payload: { type: "rpc-result"; id: number; result?: unknown; error?: string }) => {
+    worker.postMessage(payload);
+  };
+
   try {
-    return JSON.parse(content[0].text);
-  } catch {
-    return content[0].text;
+    switch (message.method) {
+      case "gateway:getCatalog":
+        respond({
+          type: "rpc-result",
+          id: message.id,
+          result: await deps.gateway.getCatalog(),
+        });
+        return;
+      case "gateway:listUpstreams":
+        respond({
+          type: "rpc-result",
+          id: message.id,
+          result: await deps.gateway.listUpstreams(),
+        });
+        return;
+      case "gateway:listTools":
+        respond({
+          type: "rpc-result",
+          id: message.id,
+          result: await deps.gateway.listTools(
+            message.args as { upstreamId?: string } | undefined,
+          ),
+        });
+        return;
+      case "gateway:refresh":
+        await deps.gateway.refresh();
+        respond({
+          type: "rpc-result",
+          id: message.id,
+          result: null,
+        });
+        return;
+      case "gateway:callTool":
+        respond({
+          type: "rpc-result",
+          id: message.id,
+          result: await deps.gateway.callTool(
+            message.args as {
+              upstreamId: string;
+              toolName: string;
+              arguments?: Record<string, unknown>;
+            },
+          ),
+        });
+        return;
+      default:
+        respond({
+          type: "rpc-result",
+          id: message.id,
+          error: `Unknown execute worker RPC method "${message.method}"`,
+        });
+    }
+  } catch (error) {
+    respond({
+      type: "rpc-result",
+      id: message.id,
+      error: normalizeError(error),
+    });
   }
 }
 
-function buildTbObject(deps: ExecuteToolDeps): Record<string, unknown> {
-  const { thoughtTool, sessionTool, knowledgeTool, notebookTool,
-          theseusTool, ulyssesTool, observabilityHandler } = deps;
+async function runInWorker(
+  input: ExecuteToolInput,
+  deps: ExecuteToolDeps,
+): Promise<ExecuteWorkerResult> {
+  return new Promise((resolve) => {
+    const worker = new Worker(`(${executeWorkerMain.toString()})();`, {
+      eval: true,
+      workerData: {
+        code: input.code,
+      },
+    });
 
-  return {
-    thought: async (input: ThoughtToolInput) =>
-      unwrapToolResult(await thoughtTool.handle(input)),
+    let settled = false;
+    const finish = (result: ExecuteWorkerResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutHandle);
+      void worker.terminate().catch(() => {});
+      resolve(result);
+    };
 
-    session: {
-      list: async (args?: { limit?: number; offset?: number; tags?: string[] }) =>
-        unwrapToolResult(await sessionTool.handle({ operation: "session_list", ...args })),
-      get: async (sessionId: string) =>
-        unwrapToolResult(await sessionTool.handle({ operation: "session_get", sessionId })),
-      search: async (query: string, limit?: number) =>
-        unwrapToolResult(await sessionTool.handle({ operation: "session_search", query, limit })),
-      resume: async (sessionId: string) =>
-        unwrapToolResult(await sessionTool.handle({ operation: "session_resume", sessionId })),
-      export: async (sessionId: string, format?: "markdown" | "cipher" | "json") =>
-        unwrapToolResult(await sessionTool.handle({ operation: "session_export", sessionId, format })),
-      analyze: async (sessionId: string) =>
-        unwrapToolResult(await sessionTool.handle({ operation: "session_analyze", sessionId })),
-      extractLearnings: async (sessionId: string, args?: Record<string, unknown>) =>
-        unwrapToolResult(await sessionTool.handle({
-          operation: "session_extract_learnings", sessionId, ...args,
-        } as SessionToolInput)),
-    },
+    const timeoutHandle = setTimeout(() => {
+      finish({
+        result: null,
+        logs: [],
+        error: "Execution timed out",
+      });
+    }, TIMEOUT_MS);
 
-    knowledge: {
-      createEntity: async (args: Record<string, unknown>) =>
-        unwrapToolResult(await knowledgeTool.handle({
-          operation: "knowledge_create_entity", ...args,
-        } as KnowledgeToolInput)),
-      getEntity: async (entityId: string) =>
-        unwrapToolResult(await knowledgeTool.handle({
-          operation: "knowledge_get_entity", entity_id: entityId,
-        } as KnowledgeToolInput)),
-      listEntities: async (args?: Record<string, unknown>) =>
-        unwrapToolResult(await knowledgeTool.handle({
-          operation: "knowledge_list_entities", ...args,
-        } as KnowledgeToolInput)),
-      addObservation: async (entityId: string, content: string, args?: Record<string, unknown>) =>
-        unwrapToolResult(await knowledgeTool.handle({
-          operation: "knowledge_add_observation", entity_id: entityId, content, ...args,
-        } as KnowledgeToolInput)),
-      createRelation: async (args: Record<string, unknown>) =>
-        unwrapToolResult(await knowledgeTool.handle({
-          operation: "knowledge_create_relation", ...args,
-        } as KnowledgeToolInput)),
-      queryGraph: async (startEntityId: string, args?: Record<string, unknown>) =>
-        unwrapToolResult(await knowledgeTool.handle({
-          operation: "knowledge_query_graph", start_entity_id: startEntityId, ...args,
-        } as KnowledgeToolInput)),
-      stats: async () =>
-        unwrapToolResult(await knowledgeTool.handle({
-          operation: "knowledge_stats",
-        } as KnowledgeToolInput)),
-    },
+    worker.on("message", (message: ExecuteWorkerMessage) => {
+      if (!message || typeof message !== "object") {
+        return;
+      }
 
-    notebook: {
-      create: async (args: Record<string, unknown>) =>
-        unwrapToolResult(await notebookTool.handle({
-          operation: "notebook_create", ...args,
-        } as NotebookToolInput)),
-      list: async () =>
-        unwrapToolResult(await notebookTool.handle({
-          operation: "notebook_list",
-        } as NotebookToolInput)),
-      load: async (args: Record<string, unknown>) =>
-        unwrapToolResult(await notebookTool.handle({
-          operation: "notebook_load", ...args,
-        } as NotebookToolInput)),
-      addCell: async (args: Record<string, unknown>) =>
-        unwrapToolResult(await notebookTool.handle({
-          operation: "notebook_add_cell", ...args,
-        } as NotebookToolInput)),
-      updateCell: async (args: Record<string, unknown>) =>
-        unwrapToolResult(await notebookTool.handle({
-          operation: "notebook_update_cell", ...args,
-        } as NotebookToolInput)),
-      runCell: async (args: Record<string, unknown>) =>
-        unwrapToolResult(await notebookTool.handle({
-          operation: "notebook_run_cell", ...args,
-        } as NotebookToolInput)),
-      listCells: async (notebookId: string) =>
-        unwrapToolResult(await notebookTool.handle({
-          operation: "notebook_list_cells", notebookId,
-        } as NotebookToolInput)),
-      getCell: async (notebookId: string, cellId: string) =>
-        unwrapToolResult(await notebookTool.handle({
-          operation: "notebook_get_cell", notebookId, cellId,
-        } as NotebookToolInput)),
-      installDeps: async (notebookId: string) =>
-        unwrapToolResult(await notebookTool.handle({
-          operation: "notebook_install_deps", notebookId,
-        } as NotebookToolInput)),
-      export: async (args: Record<string, unknown>) =>
-        unwrapToolResult(await notebookTool.handle({
-          operation: "notebook_export", ...args,
-        } as NotebookToolInput)),
-    },
+      if (message.type === "rpc") {
+        void handleWorkerRpc(deps, worker, message);
+        return;
+      }
 
-    theseus: async (input: TheseusToolInput) =>
-      unwrapToolResult(await theseusTool.handle(input)),
+      if (message.type === "result") {
+        finish({
+          result: message.result,
+          logs: Array.isArray(message.logs) ? message.logs.map(String) : [],
+          error: message.error,
+        });
+      }
+    });
 
-    ulysses: async (input: UlyssesToolInput) =>
-      unwrapToolResult(await ulyssesTool.handle(input)),
+    worker.on("error", (error) => {
+      finish({
+        result: null,
+        logs: [],
+        error: normalizeError(error),
+      });
+    });
 
-    observability: async (input: ObservabilityInput) =>
-      unwrapToolResult(await observabilityHandler.handle(input)),
-  };
+    worker.on("exit", (code) => {
+      if (settled || code === 0) {
+        return;
+      }
+
+      finish({
+        result: null,
+        logs: [],
+        error: `Execute worker exited with code ${code}`,
+      });
+    });
+  });
 }
 
 export class ExecuteTool {
@@ -214,75 +236,38 @@ export class ExecuteTool {
 
   async handle(input: ExecuteToolInput): Promise<{ content: Array<{ type: "text"; text: string }> }> {
     const start = Date.now();
-    const logs: string[] = [];
-
-    const cappedConsole = {
-      log: (...args: unknown[]) => {
-        if (logs.length < MAX_LOGS) logs.push(args.map(String).join(" "));
-      },
-      warn: (...args: unknown[]) => {
-        if (logs.length < MAX_LOGS) logs.push(`[warn] ${args.map(String).join(" ")}`);
-      },
-      error: (...args: unknown[]) => {
-        if (logs.length < MAX_LOGS) logs.push(`[error] ${args.map(String).join(" ")}`);
-      },
-    };
-
-    const tb = buildTbObject(this.deps);
-
-    // Security: pass only bridged objects, NOT host builtins.
-    // vm.createContext auto-provides context-local copies of Object,
-    // Array, Promise, etc. whose prototype chains are isolated from host.
-    // This closes [].constructor.constructor("return process")() escapes.
-    //
-    // THREAT MODEL: tb methods are host closures so
-    // tb.session.list.constructor is still host Function. node:vm is not
-    // a security boundary (https://nodejs.org/api/vm.html). The sandbox
-    // is defense-in-depth: code is LLM-generated from system-controlled
-    // prompts, not arbitrary user input. For true isolation, migrate to
-    // isolated-vm.
-    const context = vm.createContext({
-      tb,
-      console: cappedConsole,
-      setTimeout: globalThis.setTimeout,
-      clearTimeout: globalThis.clearTimeout,
-    });
 
     let output: CodeModeResult;
     try {
-      const script = new vm.Script(`(${input.code})()`, {
-        filename: "codemode-exec.js",
-      });
+      const workerResult = await runInWorker(input, this.deps);
+      if (workerResult.error) {
+        output = {
+          result: null,
+          logs: workerResult.logs,
+          error: workerResult.error,
+          durationMs: Date.now() - start,
+        };
+      } else {
+        const durationMs = Date.now() - start;
+        let serialized = JSON.stringify(workerResult.result, null, 2) ?? "null";
+        let truncated = false;
+        if (serialized.length > MAX_RESULT_BYTES) {
+          serialized = serialized.slice(0, MAX_RESULT_BYTES) + "\n... [truncated]";
+          truncated = true;
+        }
 
-      // vm.Script timeout only covers synchronous execution.
-      // Promise.race adds a wall-clock timeout for async operations.
-      const rawResult = script.runInContext(context, { timeout: TIMEOUT_MS });
-      const result = await Promise.race([
-        rawResult,
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("Execution timed out")), TIMEOUT_MS)
-        ),
-      ]);
-
-      const durationMs = Date.now() - start;
-      let serialized = JSON.stringify(result, null, 2) ?? "null";
-      let truncated = false;
-      if (serialized.length > MAX_RESULT_BYTES) {
-        serialized = serialized.slice(0, MAX_RESULT_BYTES) + "\n... [truncated]";
-        truncated = true;
+        output = {
+          result: truncated ? serialized : JSON.parse(serialized),
+          logs: workerResult.logs,
+          truncated: truncated || undefined,
+          durationMs,
+        };
       }
-
-      output = {
-        result: truncated ? serialized : JSON.parse(serialized),
-        logs,
-        truncated: truncated || undefined,
-        durationMs,
-      };
-    } catch (err) {
+    } catch (error) {
       output = {
         result: null,
-        logs,
-        error: (err as { message?: string }).message ?? String(err),
+        logs: [],
+        error: normalizeError(error),
         durationMs: Date.now() - start,
       };
     }

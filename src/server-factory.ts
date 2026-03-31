@@ -51,20 +51,11 @@ import { ThoughtboxEventEmitter } from "./events/index.js";
 import { SamplingHandler } from "./sampling/index.js";
 import { ThoughtQueryHandler } from "./resources/thought-query-handler.js";
 
-import { KnowledgeTool } from "./knowledge/tool.js";
-import { SessionTool } from "./sessions/tool.js";
-import { ThoughtTool } from "./thought/tool.js";
-import { NotebookTool } from "./notebook/tool.js";
 import {
-  TheseusTool,
-  UlyssesTool,
   ProtocolHandler,
   InMemoryProtocolHandler,
 } from "./protocol/index.js";
 import { createClient as createSupabaseClient } from "@supabase/supabase-js";
-import {
-  ObservabilityGatewayHandler,
-} from "./observability/index.js";
 import { SUBAGENT_SUMMARIZE_CONTENT } from "./resources/subagent-summarize-content.js";
 import { EVOLUTION_CHECK_CONTENT } from "./resources/evolution-check-content.js";
 import { BEHAVIORAL_TESTS } from "./resources/behavioral-tests-content.js";
@@ -82,8 +73,13 @@ import { getOperation as getNbOp } from "./notebook/operations.js";
 import {
   SearchTool, SEARCH_TOOL,
   ExecuteTool, EXECUTE_TOOL,
-  buildSearchCatalog,
 } from "./code-mode/index.js";
+import {
+  GatewayRegistry,
+  CompositeGatewayRuntime,
+  DedalusMarketplaceRuntime,
+} from "./gateway/index.js";
+import type { GatewayRuntime } from "./gateway/index.js";
 
 // Configuration schema
 // Note: Using .default() means the field is always present after parsing.
@@ -153,13 +149,13 @@ export async function createMcpServer(args: CreateMcpServerArgs = {}): Promise<M
   const config = configSchema.parse(args.config ?? {});
   const logger = args.logger ?? defaultLogger;
 
-  const THOUGHTBOX_INSTRUCTIONS = `Thoughtbox is a structured reasoning server using Code Mode.
+  const THOUGHTBOX_INSTRUCTIONS = `Thoughtbox is a code-mode-first MCP gateway.
 
 Two tools:
-- \`thoughtbox_search\`: Write JavaScript to query the operation/prompt/resource catalog
-- \`thoughtbox_execute\`: Write JavaScript using the \`tb\` SDK to chain operations
+- \`thoughtbox_search\`: Write JavaScript to query the upstream/tool catalog
+- \`thoughtbox_execute\`: Write JavaScript using the \`tb\` SDK to call proxied tools
 
-Workflow: search to discover available operations, then execute code against them.
+Workflow: search to discover available upstreams and tools, then execute code against them.
 Use \`console.log()\` for debugging — output captured in response logs.`;
 
   // Create task infrastructure if hub storage is provided
@@ -304,11 +300,6 @@ Use \`console.log()\` for debugging — output captured in response logs.`;
   // Tool Registration (all tools enabled at startup)
   // =============================================================================
 
-  const knowledgeTool = new KnowledgeTool(knowledgeHandler!);
-  const sessionTool = new SessionTool(sessionHandler);
-  const thoughtTool = new ThoughtTool(thoughtHandler);
-  const notebookTool = new NotebookTool(notebookHandler);
-
   // Auto-resolve project scope from MCP roots (or THOUGHTBOX_PROJECT env var)
   // Deferred: transport isn't connected during createMcpServer()
   let projectResolved = false;
@@ -394,29 +385,27 @@ Use \`console.log()\` for debugging — output captured in response logs.`;
     logger.info('Protocol tools using in-memory backend');
   }
 
-  const theseusTool = new TheseusTool(protocolHandler, thoughtHandler, knowledgeStorage);
-  const ulyssesTool = new UlyssesTool(protocolHandler, thoughtHandler, knowledgeStorage);
-
-  const observabilityHandler = new ObservabilityGatewayHandler({
-    storage,
-    prometheusUrl: process.env.PROMETHEUS_URL,
-    grafanaUrl: process.env.GRAFANA_URL,
-  });
-
   // =============================================================================
   // Code Mode Tools (replaces individual tool registrations)
   // =============================================================================
 
-  const searchCatalog = buildSearchCatalog();
-  const searchTool = new SearchTool(searchCatalog);
+  const fileGateway = await GatewayRegistry.fromDefaultManifest(logger);
+
+  let gateway: GatewayRuntime = fileGateway;
+  const dedalusApiKey = process.env.DEDALUS_API_KEY;
+  if (dedalusApiKey) {
+    const marketplace = new DedalusMarketplaceRuntime(
+      dedalusApiKey,
+      logger,
+    );
+    gateway = new CompositeGatewayRuntime([fileGateway, marketplace]);
+    await gateway.refresh();
+    logger.info("[Dedalus] Marketplace integration enabled");
+  }
+
+  const searchTool = new SearchTool(() => gateway.getCatalog());
   const executeTool = new ExecuteTool({
-    thoughtTool,
-    sessionTool,
-    knowledgeTool,
-    notebookTool,
-    theseusTool,
-    ulyssesTool,
-    observabilityHandler,
+    gateway,
   });
 
   registerTool(SEARCH_TOOL, searchTool);

@@ -1,320 +1,333 @@
 # Thoughtbox
 
-**Multi-agent collaborative reasoning that's auditable.** Thoughtbox is a Docker-based MCP server where AI agents coordinate through shared workspaces — claiming problems, proposing solutions, reviewing each other's work, and reaching consensus. Every step is recorded as a structured thought in a persistent reasoning ledger that can be visualized, exported, and analyzed.
+Thoughtbox is converging on a Dedalus-marketplace-compatible MCP gateway.
 
-**Local-First:** Runs entirely on your machine. All data stays at `~/.thoughtbox/` — nothing leaves your network.
+The codebase currently contains a working standalone gateway runtime. That runtime is useful because it proves the gateway core works, but it is not the final contract.
 
-![Thoughtbox Observatory](public/thoughtbox-observatory.png)
-*Observatory UI showing a reasoning session with 14 thoughts and a branch exploration (purple nodes 13-14) forking from thought 5.*
+The actual target is:
+
+- Dedalus marketplace deployment
+- Dedalus MCP scaffold/runtime compatibility
+- Thoughtbox gateway logic rehosted onto that scaffold
+
+The current runtime connects to upstream hosted HTTP MCP servers, discovers their tools, and exposes a stable two-tool surface to clients:
+
+- `thoughtbox_search` for querying the live upstream/tool catalog with JavaScript
+- `thoughtbox_execute` for listing upstreams and calling proxied tools through the `tb` SDK
+
+This fork is no longer positioned as a general multi-agent reasoning platform. The active product surface is the gateway, and the acceptance boundary is the Dedalus marketplace contract.
+
+## Status
+
+There are two truths that both matter:
+
+1. The current standalone gateway path works.
+2. It is not yet the final marketplace-native runtime shape.
+
+What is proven today:
+
+- Thoughtbox can discover upstream MCP tools
+- `thoughtbox_search` can query the live tool catalog
+- `thoughtbox_execute` can proxy a real upstream tool call
+
+What still has to change:
+
+- outer runtime and transport ownership
+- auth/header contract
+- client compatibility shaping
+- code execution isolation
+- deployment/config contract
+
+Read these next:
+
+- `docs/architecture/dedalus-marketplace-compatibility-audit.md`
+- `docs/architecture/dedalus-runtime-rehost-plan.md`
+
+## Current Standalone Scope
+
+V1 is intentionally narrow:
+
+- Hosted HTTP MCP upstreams only
+- Tools only
+- Static local manifest
+- Generic proxy-call API first
+
+Out of scope for the current standalone pass:
+
+- Prompts/resources proxying
+- Marketplace-scale concerns
+- Dynamic registry mutation
+- DAuth or runtime key injection beyond static headers
+
+## Manifest
+
+Thoughtbox loads upstreams from `thoughtbox.gateway.json` by default.
+
+You can override the path with `THOUGHTBOX_GATEWAY_MANIFEST`.
+
+Example:
+
+```json
+{
+  "version": 1,
+  "upstreams": [
+    {
+      "id": "demo",
+      "name": "Demo Server",
+      "url": "https://example.com/mcp"
+    }
+  ]
+}
+```
+
+Static headers are supported:
+
+```json
+{
+  "version": 1,
+  "upstreams": [
+    {
+      "id": "internal-api",
+      "url": "https://mcp.internal.example/mcp",
+      "headers": {
+        "x-api-key": "${INTERNAL_MCP_API_KEY}"
+      }
+    }
+  ]
+}
+```
 
 ## Code Mode
 
-Thoughtbox exposes exactly **two MCP tools** using the Code Mode pattern:
+Thoughtbox exposes exactly two MCP tools:
 
-- **`thoughtbox_search`** — Write JavaScript to query the operation/prompt/resource catalog. The LLM has full programmatic filtering power over the catalog.
-- **`thoughtbox_execute`** — Write JavaScript using the `tb` SDK to chain operations. Access thoughts, sessions, knowledge, notebooks, hub, observability, and protocol tools through a unified namespace.
+- `thoughtbox_search`
+- `thoughtbox_execute`
 
-**Workflow:** search to discover available operations, then execute code against them. Use `console.log()` for debugging — output is captured in response logs.
+### `thoughtbox_search`
 
-This replaces per-operation tool registration with a two-tool surface that scales without context window bloat.
+Write JavaScript against:
 
-## Multi-Agent Collaboration
+```ts
+interface SearchCatalog {
+  upstreams: Array<{
+    id: string
+    name: string
+    url: string
+    status: "available" | "unavailable" | "disabled"
+    toolCount: number
+    error?: string
+  }>
+  tools: Array<{
+    upstreamId: string
+    upstreamName: string
+    name: string
+    title?: string
+    description?: string
+    inputSchema: object
+    annotations?: object
+  }>
+}
+```
 
-The Hub is the coordination layer. Agents register with role-specific profiles, join shared workspaces, and work through a structured problem-solving workflow — all via `thoughtbox_execute`.
+Examples:
 
-**The workflow:** register → create workspace → create problem → claim → work → propose solution → peer review → merge → consensus
+```js
+async () => catalog.upstreams
+```
 
-**Workspace primitives:**
+```js
+async () => catalog.tools.filter((tool) => tool.upstreamId === "demo")
+```
 
-- **Problem** — A unit of work with dependencies, sub-problems, and status tracking (open → in-progress → resolved → closed)
-- **Proposal** — A proposed solution with a source branch reference and review workflow
-- **Consensus** — A decision marker tied to a thought reference for traceability
-- **Channel** — A message stream scoped to a problem for discussion
+### `thoughtbox_execute`
 
-**Agent Profiles:** `MANAGER`, `ARCHITECT`, `DEBUGGER`, `SECURITY`, `RESEARCHER`, `REVIEWER` — each provides domain-specific mental models and behavioral priming.
+Write JavaScript using:
 
-**28 operations** across identity, workspace management, problems, proposals, consensus, channels, and status reporting.
+```ts
+interface TB {
+  gateway: {
+    listUpstreams(): Promise<unknown>
+    listTools(args?: { upstreamId?: string }): Promise<unknown>
+    getCatalog(): Promise<unknown>
+    refresh(): Promise<unknown>
+    call(args: {
+      upstreamId: string
+      toolName: string
+      arguments?: Record<string, unknown>
+    }): Promise<unknown>
+  }
+  call(args: {
+    upstreamId: string
+    toolName: string
+    arguments?: Record<string, unknown>
+  }): Promise<unknown>
+}
+```
 
-## Auditable Reasoning
+Example:
 
-Every thought is a node in a graph — numbered, timestamped, linked to its predecessors, and persisted across sessions. This creates an auditable trail of how conclusions were reached.
+```js
+async () => {
+  const tools = await tb.gateway.listTools()
+  const target = tools.find((tool) => tool.name === "ping")
+  if (!target) throw new Error("No ping tool found")
 
-Agents can think forward, plan backward, branch into parallel explorations, revise earlier conclusions, and request autonomous critique via MCP sampling. Each pattern is a first-class operation:
+  return await tb.gateway.call({
+    upstreamId: target.upstreamId,
+    toolName: target.name,
+    arguments: { name: "Thoughtbox" }
+  })
+}
+```
 
-| Pattern | Description | Use Case |
-|---------|-------------|----------|
-| **Forward** | Sequential 1→2→3→N progression | Exploration, discovery, open-ended analysis |
-| **Backward** | Start at goal (N), work back to start (1) | Planning, system design, working from known goals |
-| **Branching** | Fork into parallel explorations (A, B, C...) | Comparing alternatives, A/B scenarios |
-| **Revision** | Update earlier thoughts with new information | Error correction, refined understanding |
-| **Critique** | Autonomous LLM review via MCP sampling | Self-checking, quality gates |
+## Current Local Runtime
 
-Each thought carries a semantic `thoughtType` (`reasoning`, `decision_frame`, `action_report`, `belief_snapshot`, `assumption_update`, `context_snapshot`, `progress`) that classifies *what kind* of thought it is, orthogonal to the process pattern used.
-
-See the **[Patterns Cookbook](src/resources/docs/thoughtbox-patterns-cookbook.md)** for comprehensive examples.
-
-## Real-Time Observability
-
-The **Observatory** is a built-in web UI at `http://localhost:1729` for watching reasoning unfold live.
-
-- **Live Graph** — thoughts appear as nodes in real-time via WebSocket
-- **Branch Navigation** — branches collapse into clickable stubs; drill in and back out
-- **Detail Panel** — click any node to view full thought content
-- **Multi-Session** — switch between active reasoning sessions
-- **Deep Analysis** — analyze sessions for reasoning patterns, cognitive load, and decision points
-
-The full observability stack includes OpenTelemetry tracing, Prometheus metrics, and Grafana dashboards.
-
-## Knowledge & Reasoning Tools
-
-**Knowledge Graph** — Persistent memory across sessions. Capture insights, concepts, workflows, and decisions as typed entities with typed relations (`BUILDS_ON`, `CONTRADICTS`, `SUPERSEDES`, etc.) and visibility controls (`public`, `agent-private`, `team-private`).
-
-**Notebooks** — Interactive literate programming combining documentation with executable JavaScript/TypeScript in isolated environments.
-
-## Client Compatibility
-
-> Thoughtbox is currently optimized for **Claude Code**. We are actively working on supporting additional MCP clients. Due to variation in capability support across the MCP ecosystem — server features (prompts, resources, tools), client features (roots, sampling, elicitation), and behaviors like `listChanged` notifications — we implement custom adaptations for many clients.
-
-If you're using a client other than Claude Code and encounter issues, please [open an issue](https://github.com/Kastalien-Research/thoughtbox/issues) describing your client and the problem.
-
-## Installation
-
-Thoughtbox runs as a Docker-based MCP server. It requires Docker and Docker Compose.
-
-### Quick Start
+### Local development
 
 ```bash
-git clone https://github.com/Kastalien-Research/thoughtbox.git
-cd thoughtbox
+pnpm install
+pnpm build
+pnpm dev
+```
+
+The current standalone MCP server listens on `http://localhost:1731/mcp`.
+
+### Docker
+
+```bash
 docker compose up --build
 ```
 
-This starts Thoughtbox and the full observability stack. The MCP server listens on port `1731` and the Observatory UI is available at `http://localhost:1729`.
+## MCP Client Configuration
 
-### MCP Client Configuration
+### Claude Code
 
-Since Thoughtbox uses HTTP transport, configure your MCP client to connect via URL.
-
-#### Claude Code
-
-Add to your `~/.claude/settings.json` or project `.claude/settings.json`:
+Use a project-local `.mcp.json` file or add the same entry to the current project block inside `~/.claude.json`:
 
 ```json
 {
   "mcpServers": {
     "thoughtbox": {
+      "type": "http",
       "url": "http://localhost:1731/mcp"
     }
   }
 }
 ```
 
-To connect through the observability sidecar (adds OpenTelemetry tracing):
+## Manual Smoke Test
+
+This is the simplest end-to-end local smoke test for the current standalone gateway runtime using Claude Code itself.
+
+### 1. Start the demo upstream
+
+```bash
+pnpm demo:gateway-fixture
+```
+
+This serves a tiny hosted HTTP MCP server at `http://127.0.0.1:1741/mcp` with two tools:
+
+- `ping`
+- `fixture_info`
+
+### 2. Start Thoughtbox against the demo manifest
+
+In a second terminal:
+
+```bash
+PORT=1732 THOUGHTBOX_STORAGE=memory THOUGHTBOX_GATEWAY_MANIFEST=./thoughtbox.gateway.demo.json pnpm dev
+```
+
+Thoughtbox will then proxy the fixture upstream through its normal two-tool surface at `http://localhost:1732/mcp`.
+
+`1732` is used here to avoid collisions with anything already bound to the default `1731` port.
+
+### 3. Point Claude Code at Thoughtbox
+
+Use a project-local `.mcp.json` file or add this under the current project in `~/.claude.json`:
 
 ```json
 {
   "mcpServers": {
     "thoughtbox": {
-      "url": "http://localhost:4000/mcp"
+      "type": "http",
+      "url": "http://localhost:1732/mcp"
     }
   }
 }
 ```
 
-#### Cline / VS Code
+Reload Claude Code if needed.
 
-Add to your MCP settings or `.vscode/mcp.json`:
+### 4. Run the smoke test in Claude Code
+
+Ask Claude Code to do two things:
+
+1. Use `thoughtbox_search` to inspect the available upstreams and tools
+2. Use `thoughtbox_execute` to call the proxied `ping` tool on upstream `fixture` with `{ name: "Claude Code" }`
+
+A minimal execute snippet is:
+
+```js
+async () => await tb.gateway.call({
+  upstreamId: "fixture",
+  toolName: "ping",
+  arguments: { name: "Claude Code" }
+})
+```
+
+### Expected result
+
+The proxied tool call should return text containing:
 
 ```json
 {
-  "servers": {
-    "thoughtbox": {
-      "url": "http://localhost:1731/mcp"
-    }
-  }
+  "ok": true,
+  "upstream": "gateway-fixture",
+  "greeting": "pong:Claude Code"
 }
 ```
 
-## Usage Examples
+If that works, the current standalone runtime is doing the gateway job:
 
-### Forward Thinking — Problem Analysis
+- loading a static manifest
+- discovering upstream tools
+- exposing them through `thoughtbox_search`
+- proxying a tool call through `thoughtbox_execute`
 
-```text
-Thought 1: "Users report slow checkout. Let's analyze..."
-Thought 2: "Data shows 45s average, target is 10s..."
-Thought 3: "Root causes: 3 API calls, no caching..."
-Thought 4: "Options: Redis cache, query optimization, parallel calls..."
-Thought 5: "Recommendation: Implement Redis cache for product data"
-```
-
-### Backward Thinking — System Design
-
-```text
-Thought 8: [GOAL] "System handles 10k req/s with <100ms latency"
-Thought 7: "Before that: monitoring and alerting operational"
-Thought 6: "Before that: resilience patterns implemented"
-Thought 5: "Before that: caching layer with invalidation"
-...
-Thought 1: [START] "Current state: 1k req/s, 500ms latency"
-```
-
-### Branching — Comparing Alternatives
-
-```text
-Thought 4: "Need to choose database architecture..."
-
-Branch A (thought 5): branchId="sql-path"
-  "PostgreSQL: ACID compliance, mature tooling, relational integrity"
-
-Branch B (thought 5): branchId="nosql-path"
-  "MongoDB: Flexible schema, horizontal scaling, document model"
-
-Thought 6: [SYNTHESIS] "Use PostgreSQL for transactions, MongoDB for analytics"
-```
+This is a functional gateway smoke test. It is not the final Dedalus marketplace acceptance test.
 
 ## Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DISABLE_THOUGHT_LOGGING` | Suppress thought logging to stderr | `false` |
-| `THOUGHTBOX_DATA_DIR` | Base directory for persistent storage | `~/.thoughtbox` |
-| `THOUGHTBOX_PROJECT` | Project scope for session isolation | `_default` |
-| `THOUGHTBOX_TRANSPORT` | Transport type (`stdio` or `http`) | `http` |
-| `THOUGHTBOX_STORAGE` | Storage backend (`fs`, `memory`, or `supabase`) | `fs` |
-| `THOUGHTBOX_OBSERVATORY_ENABLED` | Enable Observatory web UI | `false` |
-| `THOUGHTBOX_OBSERVATORY_PORT` | Observatory UI port | `1729` |
-| `THOUGHTBOX_OBSERVATORY_CORS` | CORS origins for Observatory (comma-separated) | (none) |
-| `THOUGHTBOX_AGENT_ID` | Pre-assigned Hub agent ID | (none) |
-| `THOUGHTBOX_AGENT_NAME` | Pre-assigned Hub agent name | (none) |
-| `THOUGHTBOX_EVENTS_ENABLED` | Enable event emission | `false` |
-| `THOUGHTBOX_EVENTS_DEST` | Event destination | `stderr` |
-| `SUPABASE_URL` | Supabase project URL (required for `supabase` storage) | (none) |
-| `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key (required for `supabase` storage) | (none) |
+| `THOUGHTBOX_GATEWAY_MANIFEST` | Path to the gateway manifest file | `./thoughtbox.gateway.json` |
 | `PORT` | HTTP server port | `1731` |
-| `HOST` | HTTP server bind address | `0.0.0.0` |
-| `NODE_ENV` | Node environment | (none) |
-| `PROMETHEUS_URL` | Prometheus endpoint (Docker) | `http://prometheus:9090` |
-| `GRAFANA_URL` | Grafana endpoint (Docker) | `http://grafana:3000` |
+| `HOST` | HTTP bind address | `0.0.0.0` |
+| `THOUGHTBOX_TRANSPORT` | Transport type | `http` |
+| `THOUGHTBOX_DATA_DIR` | Data directory for existing persistence surfaces still present in-tree | `~/.thoughtbox` |
 
-## Development
-
-For local development (requires Node.js 22+):
-
-```bash
-pnpm install
-pnpm build
-pnpm dev      # Development with hot reload
-```
-
-### Testing
-
-```bash
-npx vitest run              # Unit tests
-pnpm test                   # Full suite (build + vitest)
-pnpm test:agentic           # Agentic tests — full suite (build + run)
-pnpm test:agentic:tool      # Agentic tests — tool-level only
-pnpm test:agentic:quick     # Agentic tests — quick (no build)
-pnpm test:behavioral        # Behavioral contract tests
-```
-
-### Docker Compose
-
-`docker compose up --build` starts the full stack:
-
-| Service | Port | Description |
-|---------|------|-------------|
-| **thoughtbox** | 1731 (MCP), 1729 (Observatory) | Core MCP server + Observatory UI |
-| **mcp-sidecar** | 4000 | Observability proxy with OpenTelemetry |
-| **otel-collector** | 4318 (HTTP), 8889 (metrics) | OpenTelemetry Collector |
-| **prometheus** | 9090 | Metrics storage + alerting |
-| **grafana** | 3001 | Dashboards and visualization |
-
-Persistent data is stored in named volumes: `thoughtbox-data`, `prometheus-data`, `grafana-data`.
-
-## Architecture
+## Current Runtime Architecture
 
 ```text
 src/
-├── index.ts                # Entry point (Streamable HTTP transport)
-├── server-factory.ts       # MCP server factory with tool registration
-├── thought-handler.ts      # Core thought recording logic
-├── types.ts                # Shared type definitions
-├── database.types.ts       # Supabase generated types
-├── code-mode/              # Code Mode tool surface
-│   ├── search-tool.ts      # thoughtbox_search — catalog query via JS
-│   ├── execute-tool.ts     # thoughtbox_execute — operation chaining via tb SDK
-│   ├── search-index.ts     # Frozen catalog of operations/prompts/resources
-│   └── sdk-types.ts        # TypeScript definitions for the tb SDK
-├── thought/                # Thought operations and tool definitions
-├── init/                   # Init workflow and state management
-│   ├── tool-handler.ts     # Init tool operations
-│   └── state-manager.ts    # Session state persistence
-├── sessions/               # Session management
-├── sampling/               # Autonomous critique via MCP sampling
-│   └── handler.ts          # SamplingHandler for LLM critique requests
-├── persistence/            # Storage layer
-│   ├── storage.ts          # InMemoryStorage with LinkedThoughtStore
-│   ├── filesystem-storage.ts  # FileSystemStorage with atomic writes
-│   └── supabase-storage.ts # SupabaseStorage for deployed/cloud usage
-├── observatory/            # Real-time visualization
-│   ├── ui/                 # Self-contained HTML/CSS/JS
-│   └── ws-server.ts        # WebSocket server for live updates
-├── hub/                    # Multi-agent collaboration
-│   ├── identity.ts         # Agent registration
-│   ├── workspace.ts        # Workspace management
-│   ├── problems.ts         # Problem tracking with dependencies
-│   ├── proposals.ts        # Solution proposals with reviews
-│   ├── consensus.ts        # Decision recording
-│   ├── channels.ts         # Problem-scoped messaging
-│   ├── hub-handler.ts      # Hub operation dispatcher
-│   └── operations.ts       # 28-operation catalog
-├── channel/                # Hub event channels and SSE streaming
-├── multi-agent/            # Agent attribution, content hashing, conflict detection
-├── protocol/               # Ulysses and Theseus protocol tools
-├── knowledge/              # Knowledge graph memory
-├── auth/                   # API key authentication
-├── audit/                  # Audit manifest generation
-├── evaluation/             # LangSmith evaluation and online monitoring
-├── notebook/               # Literate programming engine
-├── events/                 # Event emission system
-├── observability/          # Prometheus/Grafana integration
-├── prompts/                # MCP prompt definitions
-├── references/             # Anchor parsing and resolution
-├── revision/               # Revision indexing
-├── operations-tool/        # Operations tool handler
-└── resources/              # Documentation and patterns cookbook
+├── index.ts                # HTTP entrypoint
+├── server-factory.ts       # MCP server factory and tool registration
+├── gateway/
+│   ├── manifest.ts         # Static manifest loading and header interpolation
+│   ├── registry.ts         # Upstream MCP client registry and proxy calls
+│   └── types.ts            # Gateway runtime contracts
+├── code-mode/
+│   ├── search-tool.ts      # thoughtbox_search
+│   ├── execute-tool.ts     # thoughtbox_execute
+│   ├── search-index.ts     # Gateway catalog shape
+│   └── sdk-types.ts        # tb SDK typings embedded in tool descriptions
 ```
 
-### Storage
+Large portions of the previous Thoughtbox codebase still remain in-tree, but they are no longer the active product story.
 
-Thoughtbox supports three storage backends:
+The current runtime above should be treated as the working gateway core. The target runtime is the Dedalus-compatible rehost described in:
 
-- **InMemoryStorage**: Volatile storage for testing, uses `LinkedThoughtStore` for O(1) thought lookups
-- **FileSystemStorage**: Persistent storage with atomic writes and project isolation (default)
-- **SupabaseStorage**: Cloud-native storage backed by Supabase Postgres for deployed instances
-
-Data is stored at `~/.thoughtbox/` by default (FileSystemStorage):
-```text
-~/.thoughtbox/
-├── config.json           # Global configuration
-└── projects/
-    └── {project}/
-        └── sessions/
-            └── {date}/
-                └── {session-id}/
-                    ├── manifest.json
-                    └── {thought-number}.json
-```
-
-## Contributing
-
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for:
-
-- Development setup
-- Commit conventions (optimized for `thick_read` code comprehension)
-- Testing with vitest and agentic scripts
-- Pull request process
-
-## License
-
-MIT License — free to use, modify, and distribute.
+- `docs/architecture/dedalus-marketplace-compatibility-audit.md`
+- `docs/architecture/dedalus-runtime-rehost-plan.md`

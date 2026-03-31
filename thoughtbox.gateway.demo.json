@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "upstreams": [
+    {
+      "id": "fixture",
+      "name": "Gateway Fixture",
+      "url": "http://127.0.0.1:1741/mcp"
+    }
+  ]
+}

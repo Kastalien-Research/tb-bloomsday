@@ -1,41 +1,21 @@
-
 ## Development Workflow (Source of Truth)
 
-Every unit of work runs through two mandatory skills. Two additional protocols activate conditionally.
+This repo no longer uses Beads or `bd`.
 
-### Mandatory Skills
+Treat any historical references to Beads, `bd`, `bead-workflow`, `beads-sync`, or `.beads/` elsewhere in the tree as stale unless a user explicitly asks to restore them.
 
-**`bead-workflow`** — The process for every task, bug, or feature without exception. Enforces claim → hypothesize → implement → test → validate → close. Hooks block violations at the tool level — this is not advisory.
+### Active Workflow
 
-Read `.claude/skills/bead-workflow/SKILL.md` before starting any work.
-
-**`hdd`** — Hypothesis-Driven Development for architectural decisions, new features, protocol implementations, and behavior-changing refactors. Produces a staging ADR + spec pair that must be validated before accepting. Code is an implementation artifact; ADRs are the source of truth.
-
-Read `.claude/skills/hdd/SKILL.md` when the work requires an architectural decision.
-
-### Conditional Protocols
-
-**`ulysses-protocol`** — Activates when 2 consecutive surprises occur on a bead. A surprise-gated debugging framework that prevents hallucinated progress through pre-committed recovery actions and falsifiable hypotheses. The `bead-workflow` enforcer writes the `reflect-required` sentinel; Ulysses clears it.
-
-Invoke only when stuck: `.claude/skills/ulysses-protocol/SKILL.md`
-
-**`theseus-protocol`** — Use when the task is a refactor (structure changes, behavior preserved). Prevents Refactoring Fugue State via scope locking, adversarial Cassandra audits, and hard reversibility. Do not use for feature work or bug fixes.
-
-Invoke only for refactoring tasks: `.claude/skills/theseus-protocol/SKILL.md`
-
-### Key Rules (always apply)
-
-1. **Specs go in `.specs/`** (not `specs/`). ADRs use the HDD lifecycle: `.adr/staging/` → `.adr/accepted/` or `.adr/rejected/`.
-2. **Code and spec updates in the same commit.** If you change code that a spec describes, update the spec in the same commit.
-3. **Atomic commits.** One sub-agent = one bead = one unit of work = one commit, made after review validates the work.
-4. **Sub-agent summaries state**: Claims, Hypothesis Alignment, Tests run, Known Gaps, Risks.
-5. **Default: human is NOT in the loop.** Operate autonomously up to the escalation thresholds defined in `agentic-dev-team/agentic-dev-team-spec.md`. Escalate only when those thresholds are met.
-6. **Orchestrators don't do manual work.** Deploy sub-agents or agent teams. Protect your context window.
+- Use **GitHub Flow**: short-lived branches from `main`, one focused PR per unit of work.
+- Specs live in `.specs/`. ADRs use `.adr/staging/` and then `.adr/accepted/` or `.adr/rejected/`.
+- If code changes are described by a spec or ADR, update the doc in the same commit.
+- Keep work units small, reviewable, and branch-scoped.
+- Default: human is not in the loop. Operate autonomously up to the escalation thresholds in `agentic-dev-team/agentic-dev-team-spec.md`.
+- Use `ulysses-protocol` when debugging produces repeated surprises and you need a tighter recovery loop.
+- Use `theseus-protocol` for behavior-preserving refactors.
 
 ### References
 
-- Bead workflow: `.claude/skills/bead-workflow/SKILL.md`
-- HDD process: `.claude/skills/hdd/SKILL.md`
 - Ulysses protocol: `.claude/skills/ulysses-protocol/SKILL.md`
 - Theseus protocol: `.claude/skills/theseus-protocol/SKILL.md`
 - Agent team structure: `agentic-dev-team/agentic-dev-team-spec.md`
@@ -43,142 +23,42 @@ Invoke only for refactoring tasks: `.claude/skills/theseus-protocol/SKILL.md`
 
 ## Branch Rules for Agents
 
-This project uses **GitHub Flow**: short-lived feature branches off `main`, one PR per unit of work, merge when green. No long-lived integration branches. See `docs/WORKFLOW-MASTER-DESCRIPTION.md` § Branching Strategy for full rationale.
-
-Agent-specific enforcement rules:
+This project uses **GitHub Flow**: short-lived feature branches off `main`, one PR per unit of work, merge when green.
 
 1. **Before first commit: verify branch scope matches work.**
-   - `git branch --show-current` — check where you are
-   - `fix/X` branches are for fixing X — not for new features
-   - `feat/X` branches are for feature X — not for unrelated fixes
-   - If scope doesn't match, create a new branch from `main`
-2. **Every branch MUST have a corresponding bead.** Create the bead before creating the branch.
-3. **Branch name MUST match the bead's subject** (e.g., bead "Fix gateway timeout" → `fix/gateway-timeout`).
-4. **After PR is merged: delete the branch** (local + remote). This is not optional.
-5. **Never create branches with timestamps, UUIDs, or auto-generated suffixes.**
-6. **Never commit to `main` directly.**
-7. **Never commit to `beads-sync`.**
-8. **Plans must include branch creation as Step 0** when the work is a new unit.
+   - `git branch --show-current`
+   - `fix/X` branches are for fixing X, not unrelated features
+   - `feat/X` branches are for feature X, not unrelated fixes
+   - If scope does not match, create a new branch from `main`
+2. **Branch names must be human-readable and match the work.**
+   - Example: `fix/gateway-timeout`, `feat/http-gateway-manifest`
+3. **Never commit to `main` directly.**
+4. **Never create branches with timestamps, UUIDs, or auto-generated suffixes.**
+5. **After PR is merged: delete the branch locally and remotely.**
 
-Committing unrelated work to an existing branch pollutes PRs, makes reverts dangerous, creates merge conflicts, and makes git history useless for archaeology. **This is non-negotiable.**
+Committing unrelated work to an existing branch pollutes PRs, makes reverts dangerous, and destroys useful history.
 
 ## Landing the Plane (Session Completion)
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+When ending a work session:
 
-**MANDATORY WORKFLOW:**
-
-1. **File issues for ALL remaining work** - Every follow-up, deferred decision, or "next session" item MUST become a bead before the session ends. If an ADR references future work (e.g., "deferred to ADR-010"), create the bead now — the ADR process starts next session, but the tracking starts this one. Prose in handoff JSON is not a substitute for a bead.
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
+1. Record any remaining follow-up work in durable project artifacts if needed.
+2. Run quality gates for changed code.
+3. Confirm docs/specs are updated for any behavior changes.
+4. Push the work:
    ```bash
    git pull --rebase
-   bd sync
    git push
-   git status  # MUST show "up to date with origin"
+   git status
    ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
+5. Clean up obvious local detritus if it was created during the work.
+6. Provide a concise handoff if the work is incomplete.
 
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-
-<!-- BEGIN BEADS INTEGRATION -->
-## Issue Tracking with bd (beads)
-
-**IMPORTANT**: This project uses **bd (beads)** for ALL issue tracking. Do NOT use markdown TODOs, task lists, or other tracking methods.
-
-### Why bd?
-
-- Dependency-aware: Track blockers and relationships between issues
-- Git-friendly: Auto-syncs to JSONL for version control
-- Agent-optimized: JSON output, ready work detection, discovered-from links
-- Prevents duplicate tracking systems and confusion
-
-### Quick Start
-
-**Check for ready work:**
-
-```bash
-bd ready --json
-```
-
-**Create new issues:**
-
-```bash
-bd create "Issue title" --description="Detailed context" -t bug|feature|task -p 0-4 --json
-bd create "Issue title" --description="What this issue is about" -p 1 --deps discovered-from:bd-123 --json
-```
-
-**Claim and update:**
-
-```bash
-bd update bd-42 --status in_progress --json
-bd update bd-42 --priority 1 --json
-```
-
-**Complete work:**
-
-```bash
-bd close bd-42 --reason "Completed" --json
-```
-
-### Issue Types
-
-- `bug` - Something broken
-- `feature` - New functionality
-- `task` - Work item (tests, docs, refactoring)
-- `epic` - Large feature with subtasks
-- `chore` - Maintenance (dependencies, tooling)
-
-### Priorities
-
-- `0` - Critical (security, data loss, broken builds)
-- `1` - High (major features, important bugs)
-- `2` - Medium (default, nice-to-have)
-- `3` - Low (polish, optimization)
-- `4` - Backlog (future ideas)
-
-### Workflow for AI Agents
-
-1. **Check ready work**: `bd ready` shows unblocked issues
-2. **Claim your task**: `bd update <id> --status in_progress`
-3. **Work on it**: Implement, test, document
-4. **Discover new work?** Create linked issue:
-   - `bd create "Found bug" --description="Details about what was found" -p 1 --deps discovered-from:<parent-id>`
-5. **Complete**: `bd close <id> --reason "Done"`
-
-### Auto-Sync
-
-bd automatically syncs with git:
-
-- Exports to `.beads/issues.jsonl` after changes (5s debounce)
-- Imports from JSONL when newer (e.g., after `git pull`)
-- No manual export/import needed!
-
-### Important Rules
-
-- ✅ Use bd for ALL task tracking
-- ✅ Always use `--json` flag for programmatic use
-- ✅ Link discovered work with `discovered-from` dependencies
-- ✅ Check `bd ready` before asking "what should I work on?"
-- ❌ Do NOT create markdown TODO lists
-- ❌ Do NOT use external issue trackers
-- ❌ Do NOT duplicate tracking systems
-
-For more details, see README.md and docs/QUICKSTART.md.
-
-<!-- END BEADS INTEGRATION -->
-
+Work is not complete until the relevant commits are pushed successfully.
 
 ## Local Agent Asset Bridge (`.claude/` and `.gemini/`)
 
-These directories contain project-local agent instructions. Codex cannot natively install Claude/Gemini hooks or slash commands from them, so treat them as **manual operating instructions** for this repo.
+These directories contain project-local agent instructions. Codex cannot natively install Claude/Gemini hooks or slash commands from them, so treat them as manual operating instructions for this repo.
 
 ### Resolution Order
 
@@ -190,18 +70,18 @@ When these sources disagree, use this order:
 4. `.claude/rules/`, `.claude/agents/`, `.claude/team-prompts/`, and hook docs as supporting context
 
 Notes:
-- Prefer `.claude/` over `.gemini/`. The inventories are nearly mirrored, but `.claude/` is the primary source in this repo.
-- Treat older references to `specs/` or legacy ADR paths inside local skill docs as historical if they conflict with the rules above. The current canonical locations remain `.specs/` and `.adr/`.
+- Prefer `.claude/` over `.gemini/`.
+- Treat older references to `specs/` or legacy ADR paths inside local skill docs as historical if they conflict with the rules above. The canonical locations remain `.specs/` and `.adr/`.
+- Treat any `bd` or Beads instructions inside local skills or commands as deprecated.
 
 ### Local Skills to Honor Manually
 
 If the user invokes one of these names, or the task clearly matches one, open the matching local file and follow it directly:
 
-- **Mandatory workflow**: `bead-workflow` (every task), `hdd` (architectural decisions and new features)
-- **Conditional protocols**: `ulysses-protocol` (2+ consecutive surprises on a bead), `theseus-protocol` (refactoring tasks)
-- **Implementation**: `implement`
-- **Research and knowledge**: `research-task`, `knowledge`, `synthesize`, `distill`, `capture-learning`, `session-review`, `assumptions`, `eval`, `taste`, `diagram`
-- **Coordination and autonomy**: `team`, `hub-collab`, `deploy-team-hub`, `experiment`, `ulc-loop`, `loop-status`, `status`, `escalate`, `claude-prompt`
+- Conditional protocols: `ulysses-protocol`, `theseus-protocol`
+- Implementation: `implement`
+- Research and knowledge: `research-task`, `knowledge`, `synthesize`, `distill`, `capture-learning`, `session-review`, `assumptions`, `eval`, `taste`, `diagram`
+- Coordination and autonomy: `team`, `hub-collab`, `deploy-team-hub`, `experiment`, `ulc-loop`, `loop-status`, `status`, `escalate`, `claude-prompt`
 
 Primary path pattern:
 - `.claude/skills/<skill-name>/SKILL.md`
@@ -217,7 +97,9 @@ The following command docs are not executable slash commands in Codex, but they 
 - Development TDD profiles: `.claude/commands/development/*.md`
 - Gemini mirrors of the same procedures: `.gemini/commands/**/*.toml`
 
-If a user references `/hdd`, HDD phases, or the development TDD profiles, read the corresponding local command or skill doc first and then execute the procedure manually.
+Important:
+- HDD materials may still contain stale Beads references. Do not run `bd` commands from them.
+- If a user references `/hdd` or HDD phases, follow the architectural reasoning parts and ignore historical issue-tracker instructions.
 
 ### Local Agent and Team Prompt Reuse
 
@@ -226,20 +108,18 @@ When spawning agents or structuring multi-agent work, reuse these local prompt l
 - Role prompts: `.claude/team-prompts/_thoughtbox-process.md`, `.claude/team-prompts/architect.md`, `.claude/team-prompts/debugger.md`, `.claude/team-prompts/researcher.md`, `.claude/team-prompts/reviewer.md`
 - Specialized agents: `.claude/agents/*.md`
 
-These files define the repo's preferred agent roles for architecture, debugging, verification, research taste, regression hunting, hook health, and coordination.
-
 ### Hook-Derived Guardrails to Follow Manually
 
-Codex cannot auto-register `.claude/settings.json`, `.gemini/settings.json`, or their shell hooks here. Still, emulate the intent of the configured hook stack during normal work.
+Codex cannot auto-register `.claude/settings.json`, `.gemini/settings.json`, or their shell hooks here. Still, emulate their intent during normal work.
 
 Hook intent by event:
 
 - `PreToolUse` / `BeforeTool`: apply command safety checks before running risky shell commands. Block direct pushes to protected branches, force pushes, branch deletion, dangerous `rm -rf`, and unrequested writes to `.env`-style files.
-- `PostToolUse` / `AfterTool`: treat file access and tool side effects as auditable. Keep track of files touched, note meaningful state changes, and prefer leaving a clear trail in commit messages, beads, specs, and handoff artifacts.
+- `PostToolUse` / `AfterTool`: treat file access and tool side effects as auditable. Keep track of files touched, note meaningful state changes, and prefer leaving a clear trail in commit messages, specs, and handoff artifacts.
 - `PermissionRequest`: preserve the repo's git safety policy when escalating. Default to caution on branch-destructive operations and anything that bypasses normal review flow.
 - `UserPromptSubmit`: if a prompt implies assumptions, risks, or session context worth preserving, record them in the right project artifact instead of keeping them implicit.
 - `SessionStart`: check whether `.claude/session-handoff.json`, `.claude/rules/`, or relevant state files should shape the current task.
-- `SessionEnd` / `Stop`: before considering work complete, capture handoff context, update specs/ADRs/issues, and follow the repo's landing-the-plane steps.
+- `SessionEnd` / `Stop`: before considering work complete, capture handoff context, update specs/ADRs, and follow the landing-the-plane steps above.
 - `PreCompact`: before large context shifts, preserve the minimal durable context needed for safe continuation.
 - `Notification`: assume important async events should be surfaced clearly in commentary rather than silently ignored.
 - `SubagentStop`: when using agents, persist their outputs in durable artifacts immediately if the surrounding workflow expects that.
@@ -250,14 +130,13 @@ Concrete guardrails:
 - Do not force-push or delete branches unless the user explicitly requests it
 - Avoid modifying `.env` or other secret-bearing files unless the task explicitly requires it
 - Preserve the repo's commit-message conventions when committing
-- Treat session handoff, file-access tracking, assumption tracking, and stop-time summaries as real workflow requirements even when the hooks are not running automatically
 
 ### Knowledge and State Files Worth Consulting Selectively
 
 Use these only when relevant to the task; do not bulk-load them by default:
 
 - Session continuity: `.claude/session-handoff.json`
-- Project rules: `.claude/rules/*.md` (path-scoped, loaded automatically when matching files are read)
+- Project rules: `.claude/rules/*.md`
 - Local state: `.claude/state/*`
 
 The intent is to inherit the project's accumulated operating context without pretending the Claude/Gemini runtime integrations are literally active in Codex.

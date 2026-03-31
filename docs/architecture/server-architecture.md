@@ -2,119 +2,258 @@
 
 ## Overview
 
-Thoughtbox is a Node.js MCP server that exposes two tools over Streamable HTTP transport. Clients connect to `POST /mcp` and interact using the MCP protocol (JSON-RPC over HTTP with server-sent events).
+Thoughtbox is currently a code-mode-first MCP gateway.
 
-Package: `@kastalien-research/thoughtbox` v1.2.2
-Runtime: Node 22, ESM only, TypeScript
+The active server surface is intentionally small:
 
-## MCP Tool Surface
+- `thoughtbox_search`
+- `thoughtbox_execute`
 
-The server uses **Code Mode** — instead of exposing dozens of individual tools, it exposes two:
+Clients connect to `POST /mcp` over Streamable HTTP. Thoughtbox loads a static gateway manifest, discovers tools from hosted HTTP upstream MCP servers, and lets clients call those tools through the two-tool code-mode interface.
 
-| Tool | Purpose |
-|------|---------|
-| `thoughtbox_search` | Query the operation/prompt/resource catalog. Returns matching operations with their schemas. |
-| `thoughtbox_execute` | Execute JavaScript code against the `tb` SDK to chain operations. |
+This document describes the runtime that exists today and matches the smoke test that was validated against the local fixture upstream.
 
-The client discovers available operations via `thoughtbox_search`, then writes JavaScript that calls them via `thoughtbox_execute`. This keeps the tool count minimal while exposing the full API surface.
+## Current Scope
 
-### Operations available through Code Mode
+What is in scope right now:
 
-The operations are organized by domain:
+- Hosted HTTP MCP upstreams
+- Tool discovery
+- Tool proxying
+- Static manifest loading from `thoughtbox.gateway.json` or `THOUGHTBOX_GATEWAY_MANIFEST`
+- Direct Node runtime or Docker packaging around the same server process
 
-**Thought operations**: Record structured thoughts (reasoning, decisions, actions, beliefs, assumptions, context, progress), get thoughts, continue chains, revise thoughts, branch.
+What is not in scope for the gateway path:
 
-**Session operations**: Create sessions, list sessions, get session details, complete/abandon sessions, export, merge, tag, search.
+- Resource proxying
+- Prompt proxying
+- Dynamic upstream registry mutation
+- DAuth or runtime key injection
 
-**Knowledge operations**: Create entities, add observations, create relations, query graph, search observations (full-text), open/close entities, delete entities/relations.
+## System Context
 
-**Notebook operations**: Literate programming notebooks — create, add cells, execute, get results.
+```mermaid
+flowchart LR
+    CC["Claude Code or another MCP host"]
+    TB["Thoughtbox MCP Server\n/src/index.ts\n/src/server-factory.ts"]
+    GM["Gateway manifest\nthoughtbox.gateway.json"]
+    UP1["Hosted upstream MCP server"]
+    UP2["Hosted upstream MCP server"]
 
-**Protocol operations (Theseus + Ulysses)**: Start/end protocol sessions, manage scope, grant visas, run audits, record history.
+    CC -->|"Streamable HTTP MCP\nPOST /mcp"| TB
+    GM -->|"load at startup"| TB
+    TB -->|"MCP client: listTools / callTool"| UP1
+    TB -->|"MCP client: listTools / callTool"| UP2
+```
 
-**Observability operations**: Gateway for monitoring data.
+For the smoke test, the upstream was the local fixture server from [scripts/demo/gateway-fixture.ts](/Users/b.c.nims/dev/kastalien-research/dedalus-2026/tb-bloomsday/scripts/demo/gateway-fixture.ts), and the manifest was [thoughtbox.gateway.demo.json](/Users/b.c.nims/dev/kastalien-research/dedalus-2026/tb-bloomsday/thoughtbox.gateway.demo.json).
 
-**Hub operations**: Multi-agent collaboration — workspaces, problems, proposals, consensus, channels.
+## Main Components
 
-## Storage Backends
+```mermaid
+flowchart TD
+    subgraph Client["MCP client"]
+        Search["thoughtbox_search"]
+        Execute["thoughtbox_execute"]
+    end
 
-The server supports three storage backends, selected by `THOUGHTBOX_STORAGE` env var:
+    subgraph Thoughtbox["Thoughtbox process"]
+        HTTP["HTTP transport + MCP session map\nsrc/index.ts"]
+        Factory["Per-session server factory\nsrc/server-factory.ts"]
+        ST["SearchTool\nsrc/code-mode/search-tool.ts"]
+        ET["ExecuteTool\nsrc/code-mode/execute-tool.ts"]
+        GR["GatewayRegistry\nsrc/gateway/registry.ts"]
+        MF["Manifest loader\nsrc/gateway/manifest.ts"]
+        CAT["Search catalog builder\nsrc/code-mode/search-index.ts"]
+        HU["HostedHttpUpstream\nMCP SDK client transport"]
+    end
 
-| Backend | Env value | When | Knowledge graph |
-|---------|-----------|------|-----------------|
-| FileSystem | `fs` (default) | Local/self-hosted | No |
-| Supabase | `supabase` | Deployed (Cloud Run) | Yes |
-| In-Memory | `memory` | Testing | No |
+    subgraph Upstream["Upstream MCP servers"]
+        MCP["Hosted HTTP MCP endpoint(s)"]
+    end
 
-### Supabase storage (deployed)
+    Search --> HTTP
+    Execute --> HTTP
+    HTTP --> Factory
+    Factory --> ST
+    Factory --> ET
+    Factory --> GR
+    GR --> MF
+    GR --> CAT
+    GR --> HU
+    HU --> MCP
+```
 
-When `THOUGHTBOX_STORAGE=supabase`:
-- Storage is instantiated **per-request** with the resolved `workspaceId`
-- `SupabaseStorage` handles sessions and thoughts
-- `SupabaseKnowledgeStorage` handles entities, relations, observations
-- All queries include `workspace_id` for tenant isolation
-- Uses `service_role` key (bypasses RLS)
+### Responsibilities
 
-### FileSystem storage (local)
+| Component | Responsibility |
+|----------|----------------|
+| `src/index.ts` | Starts the HTTP server, owns the in-memory MCP session map, routes `/mcp` requests, and creates per-session server instances |
+| `src/server-factory.ts` | Registers the two public tools and wires them to a `GatewayRegistry` |
+| `src/gateway/manifest.ts` | Loads and validates the static manifest, including optional header interpolation from environment variables |
+| `src/gateway/registry.ts` | Maintains upstream connections, refreshes tool catalogs, and proxies tool calls |
+| `src/code-mode/search-tool.ts` | Runs sandboxed JavaScript over the gateway catalog |
+| `src/code-mode/execute-tool.ts` | Runs sandboxed JavaScript over the `tb.gateway` SDK object |
 
-When `THOUGHTBOX_STORAGE=fs`:
-- Data stored under `~/.thoughtbox` (or `THOUGHTBOX_DATA_DIR`)
-- Sessions as JSON files, partitioned monthly
-- No workspace scoping (single-user)
-- No knowledge graph support
+## Public Tool Surface
+
+### `thoughtbox_search`
+
+`thoughtbox_search` receives JavaScript and executes it against a catalog with two arrays:
+
+- `catalog.upstreams`
+- `catalog.tools`
+
+The catalog is synthesized from the live `GatewayRegistry` snapshot. The tool does not talk to upstream servers directly; it reads the already-built catalog.
+
+### `thoughtbox_execute`
+
+`thoughtbox_execute` receives JavaScript and executes it against a small `tb` SDK object:
+
+- `tb.gateway.listUpstreams()`
+- `tb.gateway.listTools()`
+- `tb.gateway.getCatalog()`
+- `tb.gateway.refresh()`
+- `tb.gateway.call()`
+
+`tb.gateway.call()` is the actual proxy path to upstream MCP tools.
+
+## Discovery Flow
+
+The first search or execute call causes the registry to initialize and discover upstream tools.
+
+```mermaid
+sequenceDiagram
+    participant C as Claude Code
+    participant T as Thoughtbox HTTP server
+    participant S as SearchTool
+    participant G as GatewayRegistry
+    participant U as HostedHttpUpstream
+    participant M as Upstream MCP server
+
+    C->>T: tools/call thoughtbox_search
+    T->>S: handle(code)
+    S->>G: getCatalog()
+    G->>G: ensureInitialized()
+    G->>U: refreshTools()
+    U->>M: connect + listTools()
+    M-->>U: tool definitions
+    U-->>G: tool summaries + available status
+    G-->>S: catalog snapshot
+    S-->>T: filtered result
+    T-->>C: tool list in JSON
+```
+
+Important detail: discovery is lazy. Thoughtbox does not need a separate background sync loop for the current implementation. The first request that needs gateway state triggers `refresh()`.
+
+## Proxy Call Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Claude Code
+    participant T as Thoughtbox HTTP server
+    participant E as ExecuteTool
+    participant G as GatewayRegistry
+    participant U as HostedHttpUpstream
+    participant M as Upstream MCP server
+
+    C->>T: tools/call thoughtbox_execute
+    T->>E: handle(code)
+    E->>G: callTool(upstreamId, toolName, arguments)
+    G->>U: callTool(...)
+    U->>M: tools/call ping
+    M-->>U: CallToolResult
+    U-->>G: raw upstream result
+    G-->>E: raw upstream result
+    E-->>T: JSON-wrapped result
+    T-->>C: proxied tool output
+```
+
+In the validated smoke test, this path returned:
+
+```json
+{
+  "ok": true,
+  "upstream": "gateway-fixture",
+  "greeting": "pong:Claude Code"
+}
+```
 
 ## Request Lifecycle
 
+At a high level, each new MCP session looks like this:
+
+1. HTTP request arrives at `/mcp`
+2. `src/index.ts` checks for an existing `mcp-session-id`
+3. If no session exists, Thoughtbox creates a new `McpServer` instance through `createMcpServer()`
+4. `createMcpServer()` builds a `GatewayRegistry` from the manifest and registers `thoughtbox_search` and `thoughtbox_execute`
+5. The request is handled through the MCP transport
+6. Subsequent requests on the same MCP session reuse the same transport and server instance
+
+The MCP sessions themselves are still stored in memory in the Thoughtbox process.
+
+## Manifest and Upstream Model
+
+The manifest schema is intentionally small:
+
+```json
+{
+  "version": 1,
+  "upstreams": [
+    {
+      "id": "fixture",
+      "name": "Gateway Fixture",
+      "url": "http://127.0.0.1:1741/mcp",
+      "headers": {
+        "x-api-key": "${EXAMPLE_API_KEY}"
+      },
+      "enabled": true
+    }
+  ]
+}
 ```
-1. HTTP request arrives at /mcp
-2. Extract API key (Bearer header or ?key= query param)
-3. Resolve key -> workspace_id
-   - tbx_* prefix: lookup in api_keys table, bcrypt verify
-   - Static key match: 'default-workspace'
-   - No key + supabase mode: 401
-4. Look up existing MCP session (via mcp-session-id header)
-   - Found: route to existing transport
-   - Not found: create new session
-5. Instantiate workspace-scoped storage
-6. Create MCP server with tools bound to that storage
-7. Handle MCP request (JSON-RPC)
-8. Return response (or SSE stream for notifications)
+
+Current behavior:
+
+- duplicate upstream IDs are rejected
+- JSON and YAML manifests are supported
+- header values may interpolate environment variables
+- upstream status is tracked as `available`, `unavailable`, or `disabled`
+
+## Docker vs Direct Node Runtime
+
+The gateway architecture is the same in both cases.
+
+```mermaid
+flowchart LR
+    Local["Direct Node runtime\npnpm dev / node dist/index.js"]
+    Docker["Docker container\nnode dist/index.js"]
+    Server["Thoughtbox HTTP MCP server"]
+
+    Local --> Server
+    Docker --> Server
 ```
 
-## Session Management
+Docker is packaging and network topology, not a separate application architecture. The current [docker-compose.yml](/Users/b.c.nims/dev/kastalien-research/dedalus-2026/tb-bloomsday/docker-compose.yml) simply:
 
-MCP sessions are held in-memory (`Map<string, SessionEntry>`). Each session has:
-- A `StreamableHTTPServerTransport` (handles the HTTP<->MCP bridge)
-- A configured `McpServer` instance with tools bound to workspace-scoped storage
+- builds the image from [Dockerfile](/Users/b.c.nims/dev/kastalien-research/dedalus-2026/tb-bloomsday/Dockerfile)
+- publishes port `1731`
+- sets `PORT=1731`
+- mounts `./.thoughtbox` into `/data/thoughtbox`
 
-Sessions are created on first request and destroyed on HTTP DELETE or transport close.
+For a host-local upstream fixture, Docker needs a manifest that points to `host.docker.internal` rather than `127.0.0.1`, because `127.0.0.1` from inside the container refers to the container itself.
 
-**Important**: Because sessions are in-memory, Cloud Run must route repeat requests to the same instance. This is handled by `sessionAffinity: true` in the Cloud Run config. With `maxScale: 1`, all requests hit the same instance. Scaling beyond 1 requires externalizing session state (e.g., Redis).
+## Notes on Legacy Code Still in Tree
 
-## Source Layout
+Large parts of the previous Thoughtbox codebase still exist in `src/`, including persistence, protocols, prompts, notebooks, and evaluation wiring.
 
-```
-src/
-  index.ts              Entry point — HTTP server, auth, session management
-  server-factory.ts     Creates MCP server instances with tools
-  types.ts              Shared type definitions
-  database.types.ts     Generated Supabase types
+Today, those are not the primary product story.
 
-  auth/                 API key resolution
-  code-mode/            Code Mode search + execute tools
-  thought/              Thought recording and retrieval
-  sessions/             Session CRUD
-  knowledge/            Knowledge graph (entities, relations, observations)
-  notebook/             Literate programming notebooks
-  protocol/             Theseus + Ulysses protocol handlers
-  hub/                  Multi-agent collaboration (workspaces, problems, proposals)
-  channel/              Hub event channels (SSE)
-  persistence/          Storage backends (FS, Supabase, in-memory)
-  observatory/          Debug UI server (optional)
-  evaluation/           LangSmith tracing integration
-  multi-agent/          Agent identity and attribution
-  audit/                Audit trail
-  events/               Event system
-  resources/            MCP resources
-  prompts/              MCP prompts
-```
+The active happy path for the gateway is:
+
+1. load manifest
+2. discover upstream tools
+3. expose catalog through `thoughtbox_search`
+4. proxy tool calls through `thoughtbox_execute`
+
+Anything outside that path should be treated as legacy or transitional unless it is explicitly pulled back into the gateway design.
