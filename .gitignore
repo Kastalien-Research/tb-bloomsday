@@ -148,3 +148,4 @@ thoughtbox-web-two/
 .specs/channel-daemon/chatgpt01.md
 # External reference repos — local only, not needed for deployment
 dedalus-refs/
+transcript.md
