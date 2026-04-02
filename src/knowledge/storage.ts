@@ -22,7 +22,7 @@ export interface KnowledgeStorageOptions {
 }
 
 export class FileSystemKnowledgeStorage implements KnowledgeStorage {
-  // SQLite removed — not available in this deployment
+  constructor(_options?: KnowledgeStorageOptions) { this.notAvailable(); }
 
   private notAvailable(): never {
     throw new Error('FileSystemKnowledgeStorage is not available in this deployment.');
@@ -42,4 +42,5 @@ export class FileSystemKnowledgeStorage implements KnowledgeStorage {
   async getObservations(_entityId: string): Promise<Observation[]> { this.notAvailable(); }
   async traverseGraph(_params: GraphTraversalParams): Promise<GraphTraversalResult> { this.notAvailable(); }
   async getStats(): Promise<KnowledgeStats> { this.notAvailable(); }
+  async rebuildIndexFromJsonl(): Promise<void> { this.notAvailable(); }
 }
