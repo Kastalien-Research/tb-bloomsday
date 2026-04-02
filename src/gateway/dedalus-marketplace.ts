@@ -86,6 +86,31 @@ async function fetchOpenServers(
 }
 
 // ---------------------------------------------------------------------------
+// Tool result type guards
+// ---------------------------------------------------------------------------
+
+type ContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string }
+  | { type: "audio"; data: string; mimeType: string }
+  | { type: "resource"; resource: unknown };
+
+function isContentBlock(value: unknown): value is ContentBlock {
+  if (!value || typeof value !== "object" || !("type" in value)) return false;
+  const t = (value as { type: unknown }).type;
+  return t === "text" || t === "image" || t === "audio" || t === "resource";
+}
+
+function isContentArray(value: unknown): value is ContentBlock[] {
+  return Array.isArray(value) && value.length > 0 && value.every(isContentBlock);
+}
+
+function isCallToolResult(value: unknown): value is CallToolResult {
+  if (!value || typeof value !== "object" || !("content" in value)) return false;
+  return isContentArray((value as { content: unknown }).content);
+}
+
+// ---------------------------------------------------------------------------
 // Tool execution via Dedalus chat completions
 // ---------------------------------------------------------------------------
 
@@ -146,31 +171,31 @@ async function callToolViaDedalus(
     }>;
   };
 
-  const toolResult = completion.mcp_tool_results?.find(
+  const toolResults = completion.mcp_tool_results?.filter(
     (r) => r.tool_name === toolName,
   );
+  const toolResult = toolResults?.at(-1);
 
   if (toolResult) {
-    const resultContent = toolResult.result;
-    if (
-      resultContent &&
-      typeof resultContent === "object" &&
-      "type" in resultContent &&
-      (resultContent as { type: string }).type === "text"
-    ) {
-      return {
-        content: [resultContent as { type: "text"; text: string }],
-        isError: toolResult.is_error,
-      };
+    const raw = toolResult.result;
+
+    if (isContentArray(raw)) {
+      return { content: raw as CallToolResult["content"], isError: toolResult.is_error };
+    }
+
+    if (isCallToolResult(raw)) {
+      return raw;
+    }
+
+    if (isContentBlock(raw)) {
+      return { content: [raw] as CallToolResult["content"], isError: toolResult.is_error };
     }
 
     return {
       content: [
         {
           type: "text",
-          text: typeof resultContent === "string"
-            ? resultContent
-            : JSON.stringify(resultContent, null, 2),
+          text: typeof raw === "string" ? raw : JSON.stringify(raw, null, 2),
         },
       ],
       isError: toolResult.is_error,
