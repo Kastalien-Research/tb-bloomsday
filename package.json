@@ -42,7 +42,7 @@
     "embed": "bun run embed-templates && bun run embed-loops",
     "dev": "bun run embed && tsx src/index.ts",
     "demo:gateway-fixture": "tsx scripts/demo/gateway-fixture.ts",
-    "build": "bun build src/index.ts --outfile index.js --target node",
+    "build": "bun build src/marketplace.ts --outfile index.js --target node",
     "build:local": "bun run embed && tsc && shx cp -r src/resources dist/ && shx cp -r templates dist/ && shx chmod +x dist/*.js",
     "start": "node index.js",
     "start:stateful": "node dist/http-stateful.js",
