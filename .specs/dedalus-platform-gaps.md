@@ -86,6 +86,30 @@ is the same mechanism the platform itself uses to reach servers during chat
 completions. The gateway would call `listTools()` directly and get full
 schemas, annotations, and capabilities.
 
+Auth model for this option: The gateway operator pre-registers the gateway as
+an OAuth client through the Dedalus dashboard, obtaining a `client_id`. At
+runtime, the gateway authenticates with a composite credential:
+
+- **DEDALUS_API_KEY** — identifies the caller's account and billing context
+- **OAuth access token** — scoped to the specific servers the gateway needs,
+  obtained via client credentials flow against the Dedalus authorization server
+
+The Dedalus Python MCP SDK already implements the full OAuth discovery flow
+(RFC 9728 Protected Resource Metadata → RFC 8414 Authorization Server
+Metadata → token exchange). The gateway would need the same flow in
+TypeScript, using `StreamableHTTPClientTransport` with the OAuth Bearer token
+in transport headers.
+
+The platform's `mcp.dedaluslabs.ai` routing layer would need to:
+1. Accept OAuth tokens on the `/{mcp_url}` endpoints
+2. Validate token audience matches the target server
+3. Forward the authenticated MCP request to the server process
+
+This aligns with the MCP spec's authorization model (OAuth 2.1 with PKCE,
+Protected Resource Metadata for server discovery, optional DPoP for proof of
+possession). The Python SDK has DPoP support; the TypeScript side would need
+it if the auth server requires proof-of-possession tokens.
+
 **Option C — A dedicated tool listing endpoint**
 
 ```
