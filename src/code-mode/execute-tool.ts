@@ -167,6 +167,10 @@ async function runInWorker(
       workerData: {
         code: input.code,
       },
+      resourceLimits: {
+        maxOldGenerationSizeMb: 64,
+        maxYoungGenerationSizeMb: 16,
+      },
     });
 
     let settled = false;

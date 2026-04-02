@@ -1,0 +1,786 @@
+# Thoughtbox Gateway — Code Mode MCP Server for Dedalus Marketplace
+#
+# A thin code-mode-first MCP gateway that deploys to the Dedalus Marketplace
+# and proxies the Marketplace's other servers' tools to clients through two
+# stable tools: thoughtbox_search and thoughtbox_execute.
+#
+# Agents never load per-server tool schemas into context. Instead, they write
+# JavaScript that queries a catalog and invokes tools through the tb SDK.
+#
+# Updated: 2026-04-02
+
+version: 1
+spec_format: thoughtbox-gateway/v1
+
+# =============================================================================
+# 1. SERVER IDENTITY
+# =============================================================================
+
+server:
+  name: thoughtbox-server
+  package: "@kastalien-research/thoughtbox"
+  version: 1.2.2
+  description: >
+    Code-mode-first MCP gateway for discovering and calling Dedalus Marketplace
+    tools through a two-tool surface. Agents reach any Marketplace tool
+    horizontally without loading per-server schemas into context.
+  language: typescript
+  module_system: esm  # "type": "module"
+  license: MIT
+  slug: kastalien-research/thoughtbox  # Dedalus Marketplace identifier
+  repository: https://github.com/kastalien-research/tb-bloomsday
+
+# =============================================================================
+# 2. SURFACE INVARIANT
+# =============================================================================
+# The gateway exposes exactly two MCP tools. No more. Internal routing,
+# upstream enumeration, and refresh are all reachable through code executed
+# inside thoughtbox_execute — not through additional MCP tools.
+
+surface_invariant:
+  tool_count: 2
+  rationale: >
+    Exposing more than two top-level tools defeats the horizontal gateway
+    purpose. The unit of comparison is the tool, not the server.
+
+# =============================================================================
+# 3. TOOLS
+# =============================================================================
+
+tools:
+
+  - name: thoughtbox_search
+    description: >
+      Discover gateway upstreams and proxied tools by writing JavaScript that
+      queries the catalog. The `catalog` object is available in scope with
+      `upstreams` and `tools` arrays.
+    resource: gateway.catalog
+    operation: read
+    tags: [gateway, code-mode, search]
+    annotations:
+      readOnlyHint: true
+      destructiveHint: false
+      idempotentHint: true
+    input_schema:
+      type: object
+      properties:
+        code:
+          type: string
+          description: >
+            JavaScript async arrow function that receives `catalog` and returns
+            filtered results.
+      required: [code]
+    sandbox:
+      engine: node:vm
+      timeout_ms: 10000
+      max_result_bytes: 24000
+      max_memory: not_set  # GAP: vm context has no memory cap. Lower risk than execute (shorter-lived), but Code Mode best practice recommends one.
+      max_logs: 100
+      partial_result_annotation: none  # GAP: no "X of Y" annotation on search results. Fine while catalog is small; revisit if marketplace exceeds ~100 servers.
+      context_globals:
+        - catalog  # frozen SearchCatalog object
+        - console  # capped log/warn/error
+        - JSON
+        - Object
+        - Array
+        - String
+        - Number
+        - Boolean
+        - RegExp
+        - Map
+        - Set
+        - Date
+        - Math
+        - Promise
+        - Error
+        - TypeError
+        - RangeError
+    catalog_schema:
+      upstreams:
+        type: array
+        items:
+          id: string         # "dedalus:publisher/server-name"
+          name: string
+          url: string        # "dedalus-marketplace://publisher/server-name"
+          status: enum [available, unavailable, disabled]
+          toolCount: number
+          error: string | undefined
+      tools:
+        type: array
+        items:
+          upstreamId: string
+          upstreamName: string
+          name: string
+          title: string | undefined
+          description: string | undefined
+          inputSchema: object
+          annotations: object | undefined
+    examples:
+      - description: List all upstreams
+        code: "async () => catalog.upstreams"
+      - description: Find tools by keyword
+        code: >
+          async () => catalog.tools.filter(t =>
+            (t.description ?? '').toLowerCase().includes('search'))
+      - description: Find tools with input schemas
+        code: >
+          async () => catalog.tools.filter(t =>
+            Object.keys(t.inputSchema.properties ?? {}).length > 0)
+    output:
+      type: CodeModeResult
+      schema:
+        result: unknown       # whatever the JS function returned
+        logs: string[]         # captured console output
+        error: string | undefined
+        truncated: boolean | undefined
+        durationMs: number
+
+  - name: thoughtbox_execute
+    description: >
+      Run JavaScript using the `tb` SDK to inspect upstreams and call proxied
+      MCP tools in a single call. Code runs in an isolated worker thread.
+    resource: gateway.execute
+    operation: write
+    tags: [gateway, code-mode, execute]
+    annotations:
+      readOnlyHint: false
+      destructiveHint: false
+      idempotentHint: false
+    input_schema:
+      type: object
+      properties:
+        code:
+          type: string
+          description: >
+            JavaScript async arrow function using the `tb` SDK.
+      required: [code]
+    sandbox:
+      engine: node:worker_threads
+      timeout_ms: 30000
+      max_result_bytes: 24000
+      resource_limits:
+        maxOldGenerationSizeMb: 64
+        maxYoungGenerationSizeMb: 16
+      blocked_syntax:
+        - pattern: "import\\s*\\("
+          message: Dynamic import is not available inside thoughtbox_execute.
+        - pattern: "import\\s+[^(\"'`]"
+          message: Import statements are not available inside thoughtbox_execute.
+      restricted_globals: [process, fetch, require, module, exports]
+      provided_globals: [tb, console, setTimeout, clearTimeout]
+    tb_sdk:
+      interface: TB
+      methods:
+        - name: gateway.listUpstreams
+          rpc: "gateway:listUpstreams"
+          returns: Array<GatewayUpstreamStatus>
+        - name: gateway.listTools
+          rpc: "gateway:listTools"
+          args: "{ upstreamId?: string }"
+          returns: Array<GatewayToolSummary>
+        - name: gateway.getCatalog
+          rpc: "gateway:getCatalog"
+          returns: GatewayCatalogSnapshot
+        - name: gateway.refresh
+          rpc: "gateway:refresh"
+          returns: GatewayCatalogSnapshot  # calls refresh then getCatalog
+        - name: gateway.call
+          rpc: "gateway:callTool"
+          args: "{ upstreamId: string; toolName: string; arguments?: Record<string, unknown> }"
+          returns: CallToolResult
+        - name: call  # top-level shortcut
+          rpc: "gateway:callTool"
+          args: "{ upstreamId: string; toolName: string; arguments?: Record<string, unknown> }"
+          returns: CallToolResult
+    examples:
+      - description: List all tools then call one
+        code: |
+          async () => {
+            const tools = await tb.gateway.listTools();
+            const target = tools.find(t => t.name === 'brave_web_search');
+            if (!target) throw new Error('Tool not found');
+            return await tb.gateway.call({
+              upstreamId: target.upstreamId,
+              toolName: target.name,
+              arguments: { query: 'MCP protocol' }
+            });
+          }
+      - description: List all upstreams
+        code: "async () => await tb.gateway.listUpstreams()"
+    output:
+      type: CodeModeResult
+      schema:
+        result: unknown
+        logs: string[]
+        error: string | undefined
+        truncated: boolean | undefined
+        durationMs: number
+
+# =============================================================================
+# 4. GATEWAY ARCHITECTURE
+# =============================================================================
+
+gateway:
+
+  # The gateway has two runtime implementations that are composed together.
+
+  runtimes:
+
+    - id: file_gateway
+      type: GatewayRegistry
+      description: >
+        Connects to upstream MCP servers declared in a YAML manifest file.
+        Uses StreamableHTTPClientTransport from the MCP SDK to connect to
+        each upstream, discovers their tools via listTools(), and proxies
+        callTool() requests directly.
+      manifest:
+        path: gateway-manifest.yaml
+        schema:
+          version: 1
+          upstreams:
+            type: array
+            items:
+              id: string           # unique identifier
+              name: string         # display name
+              description: string  # human-readable
+              url: string          # streamable HTTP endpoint URL
+              headers: Record<string, string>  # optional auth headers
+              enabled: boolean     # default true
+      capabilities:
+        - tool_discovery  # lists tools from upstream via MCP listTools
+        - tool_execution  # proxies callTool via MCP callTool
+
+    - id: dedalus_marketplace
+      type: DedalusMarketplaceRuntime
+      description: >
+        Fetches the public Dedalus Marketplace catalog, filters to open (no-auth)
+        servers, and presents them as virtual upstreams. Tool execution routes
+        through the Dedalus chat completions API with mcp_servers=[slug].
+      data_source:
+        url: https://www.dedaluslabs.ai/api/marketplace
+        filter: tags.auth.none === true  # only open servers
+      upstream_id_format: "dedalus:{slug}"  # e.g. "dedalus:publisher/server-name"
+      tool_execution:
+        method: POST
+        url: https://api.dedaluslabs.ai/v1/chat/completions
+        model: anthropic/claude-haiku-4-5-20251001
+        body_template:
+          model: "{model}"
+          mcp_servers: ["{slug}"]
+          messages:
+            - role: user
+              content: 'Call the tool "{toolName}" with arguments: {args}. Return only the tool result.'
+          max_tokens: 4096
+        auth: Bearer {DEDALUS_API_KEY}
+      capabilities:
+        - upstream_discovery  # lists marketplace servers as upstreams
+        - tool_execution      # proxies via chat completions API
+      limitations:
+        - no_tool_schemas  # Marketplace API does not expose individual tool schemas
+        - open_servers_only  # DAuth/OAuth servers not supported yet
+
+    - id: composite
+      type: CompositeGatewayRuntime
+      description: >
+        Composes multiple GatewayRuntime implementations. Routes tool calls
+        to the correct runtime based on upstream ID prefix.
+      routing:
+        - prefix: "dedalus:"
+          target: dedalus_marketplace
+        - default: file_gateway
+
+  types:
+    GatewayUpstreamStatus:
+      id: string
+      name: string
+      description: string | undefined
+      url: string
+      enabled: boolean
+      status: enum [available, unavailable, disabled]
+      toolCount: number
+      error: string | undefined
+
+    GatewayToolSummary:
+      upstreamId: string
+      upstreamName: string
+      name: string
+      title: string | undefined
+      description: string | undefined
+      inputSchema: Tool.inputSchema
+      annotations: Tool.annotations | undefined
+      execution: Tool.execution | undefined
+
+    GatewayCatalogSnapshot:
+      upstreams: GatewayUpstreamStatus[]
+      tools: GatewayToolSummary[]
+
+    GatewayToolCall:
+      upstreamId: string
+      toolName: string
+      arguments: Record<string, unknown> | undefined
+
+    GatewayManifest:
+      version: 1
+      upstreams: GatewayManifestUpstream[]
+
+# =============================================================================
+# 5. TRANSPORT
+# =============================================================================
+
+transport:
+  modes: [streamable_http]  # STDIO not used in marketplace deployment
+  http:
+    framework: express
+    endpoints:
+      - path: /mcp
+        method: POST
+        handler: StreamableHTTPServerTransport
+        description: MCP protocol endpoint (JSON-RPC over HTTP)
+        session: stateless  # each POST creates a new server+transport, cleaned up on response finish
+      - path: /mcp
+        method: GET
+        handler: 405 Method Not Allowed
+      - path: /mcp
+        method: DELETE
+        handler: 405 Method Not Allowed
+      - path: /health
+        method: GET
+        handler: inline
+        response: '{"status":"ok","transport":"streamable-http","server":"thoughtbox","version":"1.2.2"}'
+      - path: /info
+        method: GET
+        handler: inline
+        response: '{"status":"ok","server":{"name":"thoughtbox-server","version":"1.2.2"}}'
+    json_response: true  # enableJsonResponse on StreamableHTTPServerTransport
+    binding:
+      host: 0.0.0.0  # for container deployment
+      port: from_env(PORT, default=1731)
+
+# =============================================================================
+# 6. AUTH
+# =============================================================================
+
+auth:
+  mcp_level: optional  # server operates without auth; auth enables Dedalus proxy
+  headers:
+    - header: Authorization
+      scheme: Bearer
+      maps_to: apiKey
+    - header: x-dedalus-api-key
+      maps_to: apiKey
+    - header: x-api-key
+      maps_to: xAPIKey
+  usage: >
+    The API key is forwarded to DedalusMarketplaceRuntime.callTool() for chat
+    completions API calls. The worker thread (execute sandbox) has no access
+    to the API key value.
+
+# =============================================================================
+# 7. DXT MANIFEST (Dedalus Extension Toolkit)
+# =============================================================================
+
+dxt_manifest:
+  dxt_version: "0.2"
+  name: thoughtbox
+  server:
+    type: node
+    entry_point: dist/index.js
+    mcp_config:
+      command: node
+      args: ["${__dirname}/dist/index.js"]
+      env:
+        DEDALUS_API_KEY: "${user_config.DEDALUS_API_KEY}"
+  user_config:
+    DEDALUS_API_KEY:
+      title: Dedalus API Key
+      description: >
+        Dedalus API key, sent as Authorization: Bearer <key>. Used to call
+        Marketplace tools via thoughtbox_execute.
+      required: false
+      type: string
+  tools_declared:
+    - thoughtbox_search
+    - thoughtbox_execute
+  tools_generated: false
+  compatibility:
+    runtimes:
+      node: ">=18.0.0"
+
+# =============================================================================
+# 8. DEPENDENCIES
+# =============================================================================
+
+dependencies:
+  runtime:
+    - name: "@modelcontextprotocol/sdk"
+      version: "1.25.3"
+      purpose: MCP server and client SDK (Server, Transport, Client)
+    - name: express
+      version: "^5.1.0"
+      purpose: HTTP framework for StreamableHTTP transport
+    - name: yaml
+      version: "^2.8.2"
+      purpose: Gateway manifest parsing
+    - name: zod
+      version: "^3.25.76"
+      purpose: Input schema validation for tool parameters
+  dev:
+    - name: "@types/express"
+      version: "^5.0.5"
+    - name: "@types/node"
+      version: "^22.18.12"
+    - name: typescript
+      version: "^5.3.3"
+
+# =============================================================================
+# 9. BUILD & DEPLOYMENT
+# =============================================================================
+
+build:
+  compiler: tsc
+  source_dir: src
+  output_dir: dist
+  tsconfig:
+    target: ES2022
+    module: ES2022
+    moduleResolution: node
+    strict: true
+    esModuleInterop: true
+    skipLibCheck: true
+  entry_point: src/marketplace.ts  # → dist/marketplace.js (marketplace-only entry)
+  scripts:
+    build: "tsc && node -e \"require('fs').chmodSync('dist/index.js', '755')\""
+    start: "node dist/index.js --port 8000"
+
+deployment:
+  target: dedalus_marketplace
+  runtime: node
+  entry_point: dist/index.js
+  env_vars:
+    DEDALUS_API_KEY:
+      description: API key for Dedalus chat completions proxy
+      required: false  # server works without it; proxy calls fail
+    PORT:
+      description: HTTP listen port
+      default: "1731"
+  dockerfile: false  # built by Dedalus platform (bun bundler)
+  open_questions:
+    - id: ESM_CJS
+      description: >
+        Reference servers use "type": "commonjs", we use "type": "module".
+        Bun builds locally succeed but may cause issues in Dedalus runtime.
+    - id: SERVER_LIST_DISCOVERY
+      description: >
+        Not yet confirmed that marketplace slug is the correct mcp_servers
+        value expected by the Dedalus chat completions API at runtime.
+
+# =============================================================================
+# 10. MODULE STRUCTURE
+# =============================================================================
+
+modules:
+
+  code_mode:
+    path: src/code-mode/
+    files:
+      - search-tool.ts    # SearchTool class + SEARCH_TOOL definition
+      - execute-tool.ts   # ExecuteTool class + EXECUTE_TOOL definition
+      - execute-worker.ts # Worker thread entry point (executeWorkerMain)
+      - sdk-types.ts      # TB_SDK_TYPES string embedded in tool description
+      - search-index.ts   # SearchCatalog type + buildSearchCatalog
+      - types.ts          # CodeModeResult interface
+      - trace.ts          # traceSearch/traceExecute observability
+      - index.ts          # re-exports
+
+  gateway:
+    path: src/gateway/
+    files:
+      - types.ts               # GatewayRuntime, GatewayManifest, etc.
+      - registry.ts            # GatewayRegistry (manifest-based, HTTP upstreams)
+      - dedalus-marketplace.ts # DedalusMarketplaceRuntime + CompositeGatewayRuntime
+      - manifest.ts            # loadGatewayManifest, resolveManifestHeaders
+      - index.ts               # re-exports
+
+  dedalus_marketplace:
+    path: src/dedalus-marketplace/
+    files:
+      - server.ts    # newThoughtboxMarketplaceServer, initThoughtboxMarketplaceServer
+      - endpoints.ts # createThoughtboxMarketplaceEndpoints (wires search + execute)
+      - http.ts      # createThoughtboxMarketplaceHttpApp (Express app)
+      - auth.ts      # parseMarketplaceAuthHeaders
+
+  entry:
+    path: src/
+    files:
+      - marketplace.ts  # Production entry point (minimal gateway only)
+
+# =============================================================================
+# 11. DATA FLOW
+# =============================================================================
+
+data_flow:
+  search:
+    sequence:
+      - client sends MCP callTool(thoughtbox_search, { code })
+      - Express POST /mcp → StreamableHTTPServerTransport
+      - McpServer dispatches to SearchTool.handle()
+      - SearchTool calls gateway.getCatalog() to get current snapshot
+      - Code runs in vm.createContext with frozen catalog
+      - Result serialized, truncated if > 24KB, wrapped in CodeModeResult
+
+  execute:
+    sequence:
+      - client sends MCP callTool(thoughtbox_execute, { code })
+      - Express POST /mcp → StreamableHTTPServerTransport
+      - McpServer dispatches to ExecuteTool.handle()
+      - ExecuteTool spawns Worker thread with code as workerData
+      - Worker creates tb SDK object backed by RPC to host via parentPort
+      - Code invokes tb.gateway.* methods → worker posts RPC message to host
+      - Host dispatches RPC to GatewayRuntime (file or marketplace)
+      - For marketplace: callToolViaDedalus → POST /v1/chat/completions
+      - Worker posts result back → host serializes, truncates, wraps in CodeModeResult
+
+  marketplace_discovery:
+    sequence:
+      - DedalusMarketplaceRuntime.refresh() fetches https://www.dedaluslabs.ai/api/marketplace
+      - Filters to repositories where tags.auth.none === true
+      - Maps each repo to GatewayUpstreamStatus with id "dedalus:{slug}"
+      - Catalog is available immediately for search; tool schemas are empty
+      - Tool execution goes through chat completions proxy (not direct MCP)
+
+# =============================================================================
+# 12. SECURITY BOUNDARIES
+# =============================================================================
+
+security:
+  worker_isolation:
+    - execute code runs in Worker thread, not main process
+    - restricted globals: process, fetch, require, module, exports
+    - blocked syntax: import statements and dynamic import()
+    - timeout enforced at 30s
+    - result truncated at 24KB
+  search_isolation:
+    - search code runs in vm.createContext (separate V8 context)
+    - catalog object is Object.freeze()'d
+    - timeout enforced at 10s
+    - result truncated at 24KB
+  api_key_protection:
+    - DEDALUS_API_KEY never passed to worker thread
+    - Worker communicates via RPC; host applies API key at call site
+    - Auth headers parsed at transport layer, not in tool handlers
+
+# =============================================================================
+# 13. MCP SERVER INSTRUCTIONS
+# =============================================================================
+
+instructions: |
+  Thoughtbox is a code-mode-first MCP gateway.
+
+  Two tools:
+  - `thoughtbox_search`: Write JavaScript to query the upstream/tool catalog
+  - `thoughtbox_execute`: Write JavaScript using the `tb` SDK to call proxied tools
+
+  Workflow: search to discover available upstreams and tools, then execute code against them.
+  Use `console.log()` for debugging — output captured in response logs.
+
+# =============================================================================
+# 14. REFERENCE: UPSTREAM SERVER SPECS
+# =============================================================================
+# YAML specs for the three reference servers in dedalus-refs/example-servers/.
+# These demonstrate the patterns that Marketplace servers follow.
+
+reference_servers:
+
+  - name: brave-search-mcp
+    slug: windsornguyen/brave-search-mcp
+    language: typescript
+    sdk_version: "@modelcontextprotocol/sdk@1.16.0"
+    transport: [stdio, streamable_http]
+    auth:
+      mcp_level: none
+      upstream:
+        - service: brave_search_api
+          env_var: BRAVE_API_KEY
+          header: X-Subscription-Token
+    tools:
+      - name: brave_web_search
+        description: Web search via Brave Search API
+        params:
+          query: { type: string, required: true }
+          count: { type: number, default: 10 }
+          offset: { type: number, default: 0 }
+      - name: brave_local_search
+        description: Local business search via Brave Local Search API
+        params:
+          query: { type: string, required: true }
+          count: { type: number, default: 5 }
+    deployment:
+      entry_point: dist/index.js
+      runtime: node
+      dockerfile: true
+
+  - name: dedalus-marketplace-crawler
+    slug: dedalus/marketplace-crawler-mcp
+    language: typescript
+    sdk_version: "@modelcontextprotocol/sdk@^1.17.3"
+    transport: [stdio, streamable_http]
+    auth:
+      mcp_level: none
+      upstream: []
+    tools:
+      - name: scan_marketplace
+        description: Crawl the Dedalus Marketplace and list all available MCP servers
+        params:
+          include_tools: { type: boolean, default: false }
+    deployment:
+      entry_point: dist/index.js
+      runtime: node
+
+  - name: dauth-mcp-server
+    slug: null  # not published
+    language: python
+    framework: dedalus_mcp
+    transport: [stdio, streamable_http]
+    auth:
+      mcp_level: api_key  # DAuth enabled
+      connections:
+        - name: supabase
+          secrets: [SUPABASE_URL, SUPABASE_KEY]
+        - name: postgres
+          secrets: [POSTGRES_HOST, POSTGRES_PORT, POSTGRES_DB, POSTGRES_USER, POSTGRES_PASSWORD]
+        - name: brave_search
+          secrets: [BRAVE_API_KEY]
+          base_url: https://api.search.brave.com/res/v1
+          auth_header: X-Subscription-Token
+        - name: slack
+          secrets: [SLACK_BOT_TOKEN]
+          base_url: https://slack.com/api
+          auth_header: "Authorization: Bearer {api_key}"
+        - name: openweather
+          secrets: [OPENWEATHER_API_KEY]
+          base_url: https://api.openweathermap.org/data/2.5
+    tools:
+      - { name: supabase_query, module: database }
+      - { name: supabase_insert, module: database }
+      - { name: supabase_update, module: database }
+      - { name: postgres_execute, module: database }
+      - { name: calculate_discount, module: business }
+      - { name: validate_email, module: business }
+      - { name: generate_invoice, module: business }
+      - { name: schedule_reminder, module: business }
+      - { name: analyze_csv_data, module: data }
+      - { name: transform_json_data, module: data }
+      - { name: filter_data, module: data }
+      - { name: aggregate_data, module: data }
+      - { name: merge_datasets, module: data }
+      - { name: brave_search, module: api }
+      - { name: slack_send_message, module: api }
+      - { name: slack_list_channels, module: api }
+      - { name: get_weather, module: api }
+    deployment:
+      entry_point: main.py
+      runtime: python
+
+# =============================================================================
+# 15. DEDALUS PLATFORM INTEGRATION
+# =============================================================================
+
+platform:
+  api:
+    base_url: https://api.dedaluslabs.ai
+    auth: "Authorization: Bearer {DEDALUS_API_KEY}"
+    endpoints:
+      chat_completions:
+        method: POST
+        path: /v1/chat/completions
+        description: >
+          Chat completions with server-side MCP tool execution.
+          The gateway uses this to proxy tool calls through Dedalus.
+        key_fields:
+          model: string  # e.g. "anthropic/claude-haiku-4-5-20251001"
+          mcp_servers: string | MCPServerSpec | MCPServers
+          messages: ChatCompletionMessage[]
+          max_tokens: number
+          automatic_tool_execution: boolean  # default true
+          credentials: Credential | MCPCredentials  # for DAuth servers
+      list_models:
+        method: GET
+        path: /v1/models
+        description: List available models across all providers
+      retrieve_model:
+        method: GET
+        path: /v1/models/{model_id}
+  mcp_server_spec:
+    slug_pattern: "^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+$"
+    examples:
+      - slug: "dedalus-labs/brave-search"
+      - url: "https://mcp.dedaluslabs.ai/dedalus-labs/example-server-1"
+      - slug: "dedalus-labs/example-server-1"
+        version: "v1.0.0"
+        name: "my-instance"
+  marketplace:
+    catalog_url: https://www.dedaluslabs.ai/api/marketplace
+    mcp_base_url: https://mcp.dedaluslabs.ai
+    response_schema:
+      repositories:
+        type: array
+        items:
+          repo_id: string
+          slug: string  # publisher/name format
+          title: string | null
+          subtitle: string | null
+          description: string | null
+          visibility: string
+          tool_count: number
+          has_dauth: boolean
+          mcp_url: string | null
+          tags:
+            auth: { none: boolean, oauth: boolean, api_key: boolean }
+            language: string
+            use_cases: Record<string, boolean>
+
+# =============================================================================
+# 16. OPEN QUESTIONS & STATUS
+# =============================================================================
+
+open_questions:
+
+  - id: SERVER_LIST_DISCOVERY
+    priority: highest
+    question: >
+      From where does the gateway obtain the Marketplace server identifiers
+      (mcp_servers values) to pass into Dedalus execution?
+    status: unresolved
+    current_approach: >
+      Fetches public catalog, uses slug as mcp_servers value. Not confirmed
+      that this is the correct format the Dedalus API expects.
+
+  - id: ESM_CJS_COMPAT
+    priority: medium
+    question: >
+      Reference servers use "type": "commonjs", we use "type": "module".
+      Dedalus platform uses bun to bundle. Does ESM work?
+    status: unknown
+    notes: Local bun builds succeed; needs deployment test.
+
+  - id: DAUTH_INTEGRATION
+    priority: low
+    question: >
+      How should the gateway handle DAuth-enabled upstream servers that require
+      credentials? The Dedalus API supports a credentials field in MCPServerSpec.
+    status: out_of_scope_for_v1
+
+capabilities_status:
+  discover_tools: proven_locally
+  execute_tool: proven_locally
+  list_upstreams: proven_locally
+  authenticated_access: implemented_untested_e2e
+  marketplace_deployment: not_proven
+
+out_of_scope:
+  - Prompts or resources proxying — tools only
+  - Authenticated Marketplace servers (OAuth / api_key tagged)
+  - Dynamic registry mutation at runtime
+  - Typed per-tool wrappers beyond generic tb.gateway.call()
+  - DAuth integration beyond static header passthrough
+  - Self-improvement loop, observatory, notebook features

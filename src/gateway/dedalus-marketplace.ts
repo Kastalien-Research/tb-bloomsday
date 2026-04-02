@@ -136,7 +136,46 @@ async function callToolViaDedalus(
     choices?: Array<{
       message?: { content?: string; tool_calls?: unknown[] };
     }>;
+    mcp_tool_results?: Array<{
+      tool_name: string;
+      server_name: string;
+      arguments: Record<string, unknown>;
+      result: unknown;
+      is_error: boolean;
+      duration_ms?: number;
+    }>;
   };
+
+  const toolResult = completion.mcp_tool_results?.find(
+    (r) => r.tool_name === toolName,
+  );
+
+  if (toolResult) {
+    const resultContent = toolResult.result;
+    if (
+      resultContent &&
+      typeof resultContent === "object" &&
+      "type" in resultContent &&
+      (resultContent as { type: string }).type === "text"
+    ) {
+      return {
+        content: [resultContent as { type: "text"; text: string }],
+        isError: toolResult.is_error,
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: typeof resultContent === "string"
+            ? resultContent
+            : JSON.stringify(resultContent, null, 2),
+        },
+      ],
+      isError: toolResult.is_error,
+    };
+  }
 
   const message = completion.choices?.[0]?.message;
   const text = message?.content ?? "";
