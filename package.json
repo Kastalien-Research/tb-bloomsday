@@ -23,8 +23,7 @@
     "llm"
   ],
   "type": "module",
-  "main": "./dist/index.js",
-  "module": "src/index.ts",
+  "main": "src/marketplace.ts",
   "types": "./dist/index.d.ts",
   "bin": {
     "thoughtbox": "./dist/index.js",
