@@ -92,7 +92,7 @@ async function handleWorkerRpc(
   message: Extract<ExecuteWorkerMessage, { type: "rpc" }>,
 ): Promise<void> {
   const respond = (payload: { type: "rpc-result"; id: number; result?: unknown; error?: string }) => {
-    worker.postMessage(payload);
+    worker.postMessage(payload); // eslint-disable-line unicorn/require-post-message-target-origin
   };
 
   try {
