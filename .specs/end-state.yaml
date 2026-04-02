@@ -1,0 +1,177 @@
+# tb-bloomsday: Gateway End State
+#
+# Defines what a user or agent can do when this project is complete.
+# This is the authoritative acceptance target.
+#
+# Status values:
+#   proven_locally          — works in local dev against a fixture or real upstream
+#   implemented_untested_e2e — code exists, not yet verified end-to-end in deployment
+#   not_proven              — not yet confirmed to work; may be blocked
+#
+# Updated: 2026-04-01
+
+version: 1
+product: tb-bloomsday
+summary: >
+  A thin code-mode MCP gateway deployed on the Dedalus Marketplace.
+  Agents reach any Marketplace tool horizontally through two stable tools,
+  without loading per-server schemas into context. The unit of comparison
+  is the tool, not the server.
+
+# ---------------------------------------------------------------------------
+# Primary capabilities
+# Each entry = one observable action an agent or user can take when done.
+# ---------------------------------------------------------------------------
+capabilities:
+
+  - id: CAP-001
+    name: discover_tools
+    description: >
+      An agent calls thoughtbox_search with a JavaScript expression to query
+      the live Marketplace tool catalog and receive a list of matching tools
+      with their upstream server, name, and description.
+    example: |
+      thoughtbox_search({
+        code: "async () => catalog.tools.filter(t => t.description.includes('github'))"
+      })
+    verified_by:
+      - Search returns results drawn from the live Dedalus Marketplace catalog
+      - Each result includes upstreamId, name, and description
+      - No per-server tool schema is injected into the calling agent's context
+    status: proven_locally
+
+  - id: CAP-002
+    name: execute_tool
+    description: >
+      An agent calls thoughtbox_execute with a JavaScript async arrow function
+      using the tb SDK to invoke a Marketplace tool by name and receive its result.
+    example: |
+      thoughtbox_execute({
+        code: |
+          async () => await tb.gateway.call({
+            upstreamId: 'dedalus:some-slug',
+            toolName: 'some_tool',
+            arguments: { q: 'hello' }
+          })
+      })
+    verified_by:
+      - tb.gateway.call() routes through the Dedalus chat completions API with mcp_servers:[slug]
+      - The tool result is returned to the calling agent
+      - JavaScript runs in an isolated worker thread, not in the host process
+      - Execution timeout (30s) is enforced; results are truncated at 24KB
+    status: proven_locally
+
+  - id: CAP-003
+    name: list_upstreams
+    description: >
+      An agent enumerates all available Marketplace servers and their tool counts
+      via the tb SDK inside thoughtbox_execute.
+    example: |
+      thoughtbox_execute({
+        code: "async () => await tb.gateway.listUpstreams()"
+      })
+    verified_by:
+      - Returns a list of upstream objects with id, name, description, and toolCount
+      - List is sourced from the live Dedalus Marketplace (open/no-auth servers only)
+    status: proven_locally
+
+  - id: CAP-004
+    name: authenticated_access
+    description: >
+      A caller presents a Dedalus API key via Authorization Bearer token or
+      x-dedalus-api-key header. That key is forwarded to all downstream Dedalus
+      tool calls without being readable by LLM-generated code in the worker.
+    verified_by:
+      - Bearer token parsed from Authorization header reaches DedalusMarketplaceRuntime.callTool()
+      - x-dedalus-api-key header is accepted as fallback
+      - The worker thread has no access to the API key value
+    status: implemented_untested_e2e
+
+  - id: CAP-005
+    name: marketplace_deployment
+    description: >
+      The gateway runs as a Dedalus Marketplace MCP server, reachable by any
+      Dedalus agent. The outer runtime and transport are owned by the Dedalus
+      scaffold; our code provides the gateway logic only.
+    verified_by:
+      - Server passes the Dedalus MCP scaffold compatibility audit
+      - A Dedalus agent can connect and successfully call both thoughtbox_search and thoughtbox_execute
+      - Auth contract matches how the Dedalus runtime injects caller credentials
+      - Deployment config (Dockerfile or cloud-run-service.yaml) reflects the scaffold contract
+    status: not_proven  # deployment attempted 2026-04-01; build failed (missing manifest.json, now fixed); retry pending
+
+# ---------------------------------------------------------------------------
+# Outer surface invariant
+# Must hold at every status level, not just at done.
+# ---------------------------------------------------------------------------
+surface_invariant:
+  tool_count: 2
+  tools:
+    - thoughtbox_search
+    - thoughtbox_execute
+  rationale: >
+    Exposing more than two top-level tools defeats the horizontal gateway purpose.
+    Internal routing, upstream enumeration, and refresh are all reachable through
+    code executed inside thoughtbox_execute — not through additional MCP tools.
+
+# ---------------------------------------------------------------------------
+# Out of scope (explicitly excluded from done)
+# ---------------------------------------------------------------------------
+out_of_scope:
+  - Prompts or resources proxying — tools only
+  - Authenticated Marketplace servers (OAuth / api_key tagged) — open/no-auth servers only for now
+  - Dynamic registry mutation at runtime
+  - Typed per-tool wrappers beyond the generic tb.gateway.call() surface
+  - DAuth integration or runtime key injection beyond static header passthrough
+  - Self-improvement loop, observatory, notebook features
+  - Hub-first orchestration product path
+  - Beads / bd workflow
+
+# ---------------------------------------------------------------------------
+# Open questions that must be resolved before CAP-005 can be verified
+# ---------------------------------------------------------------------------
+open_questions:
+
+  - id: SERVER_LIST_DISCOVERY
+    priority: highest
+    question: >
+      From where does the gateway obtain the Marketplace server identifiers
+      (mcp_servers values) to pass into Dedalus execution?
+    why_it_matters: >
+      DedalusMarketplaceRuntime currently fetches open servers from the public
+      Marketplace catalog API and uses their slugs as mcp_servers values. It is
+      not yet confirmed that the slug is the correct identifier format expected
+      by the Dedalus chat completions API at runtime, or that the public catalog
+      is the intended discovery mechanism for a deployed Marketplace server.
+    acceptable_resolutions:
+      - A documented API endpoint confirmed to return available server identifiers for the caller
+      - An SDK method confirmed to return the correct mcp_servers values
+      - Explicit confirmation that the public Marketplace slug is the correct mcp_servers value
+      - Explicit confirmation that the gateway maintains its own static server list
+    do_not_proceed_with:
+      - Architectural refactoring that assumes this is solved
+      - Treating API plausibility as proof of the discovery mechanism
+    status: unresolved
+    source: docs/architecture/dedalus-marketplace-session-handoff-2026-03-31.md
+
+  - id: SCAFFOLD_CONTRACT
+    priority: high
+    question: >
+      What is the exact runtime contract for a server deployed on the Dedalus
+      Marketplace? Specifically: transport protocol, build system, entry point
+      format, auth injection, and ESM/CJS compatibility.
+    why_it_matters: >
+      CAP-005 cannot be verified without knowing the scaffold contract.
+    findings:
+      - transport: StreamableHTTPServerTransport via Express — confirmed from dedalus-refs ✅
+      - auth_injection: Bearer token → apiKey, x-dedalus-api-key → apiKey — confirmed, matches our auth.ts ✅
+      - build_system: Dedalus uses bun to bundle on their platform — confirmed from build logs ✅
+      - manifest_format: DXT v0.2 manifest.json required at repo root — confirmed from refs, was missing, now added ✅
+      - entry_point: dist/index.js — declared in manifest.json, matches our build output ✅
+      - runtime: node >=18.0.0 — confirmed from both ref manifests ✅
+    remaining_unknowns:
+      - ESM vs CJS: reference servers use "type": "commonjs", we use "type": "module".
+        Bun builds locally succeed, but this may still cause issues in Dedalus's runtime.
+        Will be confirmed or falsified by next deployment attempt.
+    status: mostly_resolved_one_unknown_remaining
+    source: docs/architecture/dedalus-marketplace-compatibility-audit.md
